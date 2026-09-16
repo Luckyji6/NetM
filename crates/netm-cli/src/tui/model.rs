@@ -172,6 +172,16 @@ pub struct GuestModel {
     pub throughput: Throughput,
     /// Set when `run` returned an error.
     pub fatal: Option<String>,
+    /// `true` once the tunnel has been up in this session. A dropped tunnel
+    /// then needs an explicit "your traffic moved back to the local network"
+    /// banner: the user was routing everything over the cable, so silence
+    /// looks like a broken machine.
+    pub had_tunnel: bool,
+    /// Interface the default route points at while no tunnel is up, as
+    /// reported by the guest.
+    pub local_egress: Option<String>,
+    /// Last Type-C link-capacity probe (not Internet).
+    pub link_speed: Option<netm_proto::LinkSpeed>,
 }
 
 impl Default for GuestModel {
@@ -181,6 +191,9 @@ impl Default for GuestModel {
             interfaces: Vec::new(),
             throughput: Throughput::default(),
             fatal: None,
+            had_tunnel: false,
+            local_egress: None,
+            link_speed: None,
         }
     }
 }
@@ -190,12 +203,16 @@ impl GuestModel {
     pub fn apply(&mut self, ev: &GuestEvent) -> bool {
         match ev {
             GuestEvent::StateChanged(s) => {
-                if !matches!(s, GuestState::Connected { .. }) {
+                if matches!(s, GuestState::Connected { .. }) {
+                    self.had_tunnel = true;
+                } else {
                     self.throughput.idle();
                 }
                 self.state = s.clone();
             }
             GuestEvent::Interfaces(list) => self.interfaces = list.clone(),
+            GuestEvent::LocalEgress(iface) => self.local_egress = iface.clone(),
+            GuestEvent::LinkSpeed(s) => self.link_speed = Some(*s),
             GuestEvent::Stats {
                 counters,
                 tx_bps,
@@ -204,6 +221,21 @@ impl GuestModel {
             GuestEvent::Log(_) | GuestEvent::Error(_) => {}
         }
         true
+    }
+
+    /// Warning to show when the tunnel has gone away after having been up:
+    /// the user's traffic silently moved back to the local network and they
+    /// need to know, since everything was routed over the cable a moment ago.
+    pub fn egress_warning(&self) -> Option<String> {
+        if !self.had_tunnel || matches!(self.state, GuestState::Connected { .. }) {
+            return None;
+        }
+        Some(match &self.local_egress {
+            Some(iface) => {
+                format!("隧道已撤销，流量已回到本机网络（{iface}）")
+            }
+            None => "隧道已撤销，流量已回到本机网络（Wi-Fi / 以太网）".into(),
+        })
     }
 }
 
@@ -268,6 +300,7 @@ pub struct HostModel {
     pub throughput: Throughput,
     pub active_flows_reported: usize,
     pub fatal: Option<String>,
+    pub link_speed: Option<netm_proto::LinkSpeed>,
 }
 
 impl HostModel {
@@ -287,6 +320,7 @@ impl HostModel {
                 self.guest = Some(g.clone());
                 self.last_disconnect = None;
                 self.flows.clear_active();
+                self.link_speed = None;
             }
             HostEvent::GuestDisconnected { reason, .. } => {
                 self.guest = None;
@@ -294,6 +328,7 @@ impl HostModel {
                 self.flows.clear_active();
                 self.throughput.idle();
             }
+            HostEvent::LinkSpeed(s) => self.link_speed = Some(*s),
             HostEvent::FlowOpened(f) => self.flows.open(f.clone()),
             HostEvent::FlowClosed {
                 id,

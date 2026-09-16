@@ -45,6 +45,75 @@ pub trait PlatformConfigurator: Send {
     fn revert(&mut self) -> Result<()>;
 }
 
+/// Name of the interface the system's default route points at, i.e. where
+/// traffic goes when no tunnel is up (`en0` for Wi-Fi on a MacBook).
+///
+/// Used to tell the user in plain words where their traffic went after the
+/// tunnel was torn down. `None` when it cannot be determined, in which case
+/// callers must not claim anything specific.
+pub fn default_egress_interface() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+            .ok()?;
+        parse_macos_default_route(&String::from_utf8_lossy(&out.stdout))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let out = Command::new("ip")
+            .args(["-4", "route", "show", "default"])
+            .output()
+            .ok()?;
+        parse_linux_default_route(&String::from_utf8_lossy(&out.stdout))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Extract `interface: enN` from `route -n get default`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_macos_default_route(text: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("interface:"))
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+/// Extract `dev <name>` from `ip route show default`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_linux_default_route(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .skip_while(|w| *w != "dev")
+        .nth(1)
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+
+    #[test]
+    fn parses_macos_default_route() {
+        let out = "   route to: default\ndestination: default\n       mask: default\n    gateway: 192.168.1.1\n  interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n";
+        assert_eq!(parse_macos_default_route(out).as_deref(), Some("en0"));
+        assert_eq!(
+            parse_macos_default_route("route: writing to routing socket: not in table"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_linux_default_route() {
+        let out = "default via 192.168.1.1 dev wlp2s0 proto dhcp metric 600\n";
+        assert_eq!(parse_linux_default_route(out).as_deref(), Some("wlp2s0"));
+        assert_eq!(parse_linux_default_route(""), None);
+    }
+}
+
 /// Output of an external command run through [`CommandRunner`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommandOutput {

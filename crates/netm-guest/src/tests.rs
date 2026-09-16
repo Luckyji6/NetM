@@ -86,6 +86,21 @@ impl GuestEnv for FakeEnv {
         Ok(self.ifaces.lock().unwrap().clone())
     }
 
+    /// Mirrors the real carrier check: tests unplug a cable by clearing the
+    /// interface's link-local address.
+    fn link_active(&mut self, iface: &str) -> Option<bool> {
+        self.ifaces
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|i| i.name == iface)
+            .map(|i| i.is_ready())
+    }
+
+    async fn local_egress(&mut self) -> Option<String> {
+        Some("fake-egress0".to_string())
+    }
+
     async fn probe(
         &mut self,
         _iface: &LinkInterface,
@@ -168,6 +183,8 @@ fn spawn_fake_host(stream: DuplexStream, config: TunnelConfig) -> FakeHost {
         .await
         .unwrap();
         f.send(Frame::Config(config)).await.unwrap();
+        let _ = netm_proto::speed::run_as_responder(&mut f, netm_proto::speed::Params::for_tests())
+            .await;
         loop {
             tokio::select! {
                 Some(frame) = inject_rx.recv() => {
@@ -217,7 +234,9 @@ fn fast_timings() -> Timings {
         keepalive_timeout: Duration::from_secs(5),
         stats_interval: Duration::from_millis(50),
         link_poll: Duration::from_millis(100),
+        iface_refresh: Duration::from_millis(100),
         send_timeout: Duration::from_secs(1),
+        speed: netm_proto::speed::Params::for_tests(),
     }
 }
 
@@ -230,6 +249,7 @@ struct Harness {
     events: mpsc::Receiver<GuestEvent>,
     ctrl: watch::Sender<GuestCommand>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    last_speed: Option<netm_proto::LinkSpeed>,
 }
 
 impl Harness {
@@ -273,6 +293,7 @@ impl Harness {
             events: ev_rx,
             ctrl: ctrl_tx,
             task,
+            last_speed: None,
         }
     }
 
@@ -292,10 +313,10 @@ impl Harness {
     /// Consume events until `pred` matches, returning the matching state.
     async fn wait_state(&mut self, pred: impl Fn(&GuestState) -> bool) -> GuestState {
         loop {
-            if let GuestEvent::StateChanged(s) = self.next_event().await {
-                if pred(&s) {
-                    return s;
-                }
+            match self.next_event().await {
+                GuestEvent::LinkSpeed(s) => self.last_speed = Some(s),
+                GuestEvent::StateChanged(s) if pred(&s) => return s,
+                _ => {}
             }
         }
     }
@@ -370,8 +391,17 @@ async fn full_session_echo_ping_stats_and_host_bye() {
     let mut tun = h.add_tun("faketun0");
     let mut host = Harness::add_link(&h.links, TunnelConfig::default());
 
-    // Event order up to Connected.
-    let first = h.next_event().await;
+    // Startup reports where traffic goes while there is no tunnel, then the
+    // interface list.
+    let mut egress = None;
+    let first = loop {
+        match h.next_event().await {
+            GuestEvent::LocalEgress(e) => egress = e,
+            GuestEvent::Log(_) | GuestEvent::LinkSpeed(_) => {}
+            other => break other,
+        }
+    };
+    assert_eq!(egress.as_deref(), Some("fake-egress0"));
     assert!(
         matches!(first, GuestEvent::Interfaces(ref l) if l.len() == 1),
         "{first:?}"
@@ -412,6 +442,8 @@ async fn full_session_echo_ping_stats_and_host_bye() {
     assert_eq!(tun_name, "faketun0");
     assert_eq!(config, TunnelConfig::default());
     assert_eq!(h.cfg_log(), vec!["apply faketun0 10.77.0.2 full dns=true"]);
+    let speed = h.last_speed.expect("link speed probe should have run");
+    assert!(speed.up_bytes > 0 && speed.down_bytes > 0, "{speed:?}");
 
     // Host saw our Hello with the configured name.
     let hello = expect_seen(&mut host, |f| matches!(f, Frame::Hello { .. })).await;
@@ -609,6 +641,42 @@ async fn manual_target_with_custom_routes_and_no_dns() {
     );
     h.finish().await.unwrap();
     expect_seen(&mut host, |f| matches!(f, Frame::Bye)).await;
+}
+
+/// A manual link-local target must not be dialled while its interface has no
+/// carrier: the connect can only fail, and retrying once a second fills the
+/// log with "No route to host" instead of showing "waiting for the cable".
+#[tokio::test]
+async fn manual_target_waits_for_the_cable_instead_of_dialling() {
+    let addr: SocketAddr = "[fe80::abcd%20]:27778".parse().unwrap();
+    let cfg = GuestConfig {
+        name: "g".into(),
+        host: HostTarget::Manual(addr),
+        routes: RouteMode::Full,
+        set_dns: false,
+        reconnect: true,
+    };
+    // Interface present but unplugged (no link-local address).
+    let mut h = Harness::start(cfg, vec![bridge_iface(false)], None);
+    h.wait_state(|s| matches!(s, GuestState::WaitingForLink))
+        .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        h.links.lock().unwrap().is_empty(),
+        "no fake link was queued, so a connect attempt would have errored"
+    );
+    assert!(h.cfg_log().is_empty(), "nothing may be configured yet");
+
+    // Plug in: now it connects to exactly the address we were given.
+    let _tun = h.add_tun("faketun9");
+    let _host = Harness::add_link(&h.links, TunnelConfig::default());
+    h.ifaces.lock().unwrap()[0].link_local_v6 = Some("fe80::1".parse().unwrap());
+    let s = h
+        .wait_state(|s| matches!(s, GuestState::Connected { .. }))
+        .await;
+    assert!(matches!(s, GuestState::Connected { host, .. } if host == addr));
+    h.ctrl.send(GuestCommand::Shutdown).unwrap();
+    h.finish().await.unwrap();
 }
 
 #[tokio::test]

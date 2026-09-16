@@ -178,6 +178,8 @@ pub enum HostEvent {
     },
     /// Human readable log line (also emitted via `tracing::info`).
     Log(String),
+    /// One-shot Type-C / Thunderbolt link-capacity probe (not Internet).
+    LinkSpeed(netm_proto::LinkSpeed),
     /// Non-fatal error description.
     Error(String),
 }

@@ -36,10 +36,17 @@ pub(crate) struct Timings {
     pub keepalive_timeout: Duration,
     /// Stats event interval while connected.
     pub stats_interval: Duration,
-    /// How often the link interface is re-checked while connected.
+    /// How often the carrier of the link interface is re-checked while
+    /// connected.
     pub link_poll: Duration,
+    /// How often the full interface list is refreshed for the UI while
+    /// connected (spawns `networksetup` on macOS, so much slower than
+    /// [`Self::link_poll`]).
+    pub iface_refresh: Duration,
     /// Timeout for a single frame write (dead peer with a full TCP window).
     pub send_timeout: Duration,
+    /// Link-capacity probe run once after the handshake.
+    pub speed: netm_proto::speed::Params,
 }
 
 impl Default for Timings {
@@ -47,13 +54,19 @@ impl Default for Timings {
         Self {
             retry_backoff: Duration::from_secs(1),
             probe_timeout: Duration::from_secs(2),
-            connect_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(3),
             handshake_timeout: Duration::from_secs(5),
-            ping_interval: Duration::from_secs(10),
-            keepalive_timeout: Duration::from_secs(30),
+            // While the tunnel carries the default route, every second spent
+            // not noticing that it is dead is a second of no network at all,
+            // so the keep-alive is aggressive: a dead peer is detected in
+            // ~6s, an unplugged cable in ~400ms via the carrier poll.
+            ping_interval: Duration::from_secs(2),
+            keepalive_timeout: Duration::from_secs(6),
             stats_interval: Duration::from_millis(500),
-            link_poll: Duration::from_secs(2),
-            send_timeout: Duration::from_secs(5),
+            link_poll: Duration::from_millis(400),
+            iface_refresh: Duration::from_secs(3),
+            send_timeout: Duration::from_secs(2),
+            speed: netm_proto::speed::Params::default(),
         }
     }
 }
@@ -282,6 +295,22 @@ impl<E: GuestEnv> Guest<E> {
         ctrl_aware(&mut self.ctrl, tokio::time::sleep(d)).await
     }
 
+    /// Report which interface carries traffic while no tunnel is up.
+    async fn report_local_egress(&mut self) {
+        let iface = self.env.local_egress().await;
+        match &iface {
+            Some(name) => {
+                self.log(format!("traffic goes through the local network via {name}"))
+                    .await
+            }
+            None => {
+                self.log("traffic goes through the local network (Wi-Fi / Ethernet)")
+                    .await
+            }
+        }
+        self.emit(GuestEvent::LocalEgress(iface)).await;
+    }
+
     /// Re-list interfaces, emitting `Interfaces` when the list changed.
     async fn refresh_interfaces(&mut self) -> Vec<LinkInterface> {
         let list = match self.env.list_interfaces().await {
@@ -301,6 +330,7 @@ impl<E: GuestEnv> Guest<E> {
     /// Main loop; returns after `Shutdown` (or after the first failure /
     /// disconnect when `reconnect` is off).
     pub(crate) async fn run(mut self) -> Result<()> {
+        self.report_local_egress().await;
         loop {
             if self.shutdown_requested() {
                 break;
@@ -351,11 +381,24 @@ impl<E: GuestEnv> Guest<E> {
     async fn find_target(&mut self) -> Result<Option<Target>, Shutdown> {
         let ifaces = self.refresh_interfaces().await;
         match self.cfg.host.clone() {
-            HostTarget::Manual(addr) => Ok(Some(Target {
-                addr,
-                host_name: None,
-                link_iface: iface_for_addr(&addr, &ifaces),
-            })),
+            HostTarget::Manual(addr) => {
+                let link_iface = iface_for_addr(&addr, &ifaces);
+                // A link-local target is unreachable until its interface has
+                // a carrier; retrying regardless just fills the log with
+                // "No route to host" once a second.
+                if let Some(name) = link_iface.as_deref() {
+                    if self.env.link_active(name) == Some(false) {
+                        self.set_state(GuestState::WaitingForLink).await;
+                        self.sleep(self.timings.retry_backoff).await?;
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(Target {
+                    addr,
+                    host_name: None,
+                    link_iface,
+                }))
+            }
             HostTarget::Auto => {
                 let ready: Vec<LinkInterface> =
                     ifaces.into_iter().filter(|i| i.is_ready()).collect();
@@ -435,6 +478,32 @@ impl<E: GuestEnv> Guest<E> {
         ))
         .await;
 
+        match ctrl_aware(
+            &mut self.ctrl,
+            netm_proto::speed::run_as_initiator(&mut framed, self.timings.speed),
+        )
+        .await
+        {
+            Err(Shutdown) => {
+                let _ = send_frame(&mut framed, Frame::Bye, Duration::from_millis(200)).await;
+                return Outcome::Shutdown;
+            }
+            Ok(Ok(speed)) => {
+                tracing::info!(summary = %speed.summary(), "link capacity");
+                self.emit(GuestEvent::LinkSpeed(speed)).await;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "link capacity probe failed");
+                self.log(format!("link capacity probe skipped: {e}")).await;
+                if matches!(
+                    e,
+                    netm_proto::speed::Error::Closed | netm_proto::speed::Error::Codec(_)
+                ) {
+                    return Outcome::Failed(anyhow!("link capacity probe: {e}"));
+                }
+            }
+        }
+
         let tun = match ctrl_aware(&mut self.ctrl, self.env.open_tun(&tcfg)).await {
             Err(Shutdown) => {
                 let _ = send_frame(&mut framed, Frame::Bye, Duration::from_millis(200)).await;
@@ -505,6 +574,10 @@ impl<E: GuestEnv> Guest<E> {
         drop(_configurator);
         drop(tun);
         self.log(format!("tunnel {tun_name} torn down")).await;
+        // The user was just routing everything through a cable that is now
+        // gone; say where their traffic goes instead, otherwise a dropped
+        // tunnel looks exactly like a broken machine.
+        self.report_local_egress().await;
 
         match end {
             SessionEnd::Shutdown => Outcome::Shutdown,
@@ -532,6 +605,11 @@ impl<E: GuestEnv> Guest<E> {
         let mut link =
             tokio::time::interval_at(tokio::time::Instant::now() + t.link_poll, t.link_poll);
         link.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut ifaces = tokio::time::interval_at(
+            tokio::time::Instant::now() + t.iface_refresh,
+            t.iface_refresh,
+        );
+        ifaces.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_rx = Instant::now();
 
         loop {
@@ -564,6 +642,9 @@ impl<E: GuestEnv> Guest<E> {
                         }
                         Some(Ok(Frame::Bye)) => {
                             return SessionEnd::HostClosed("host closed the tunnel (Bye)".into());
+                        }
+                        Some(Ok(Frame::SpeedChunk(_) | Frame::SpeedDone(_) | Frame::SpeedResult { .. })) => {
+                            last_rx = Instant::now();
                         }
                         Some(Ok(other)) => {
                             last_rx = Instant::now();
@@ -611,13 +692,18 @@ impl<E: GuestEnv> Guest<E> {
                         rx_bps,
                     });
                 }
+                // Carrier poll: the cheapest and by far the fastest way to
+                // notice that the cable was pulled. Waiting for the
+                // keep-alive to expire instead would black-hole every packet
+                // the default route sends into the dead tunnel meanwhile.
                 _ = link.tick(), if link_iface.is_some() => {
                     let name = link_iface.unwrap_or_default();
-                    let ifaces = self.refresh_interfaces().await;
-                    let still_ready = ifaces.iter().any(|i| i.name == name && i.is_ready());
-                    if !still_ready {
-                        return SessionEnd::Lost(format!("link {name} lost (no link-local address)"));
+                    if self.env.link_active(name) == Some(false) {
+                        return SessionEnd::Lost(format!("link {name} lost (cable unplugged)"));
                     }
+                }
+                _ = ifaces.tick() => {
+                    self.refresh_interfaces().await;
                 }
             }
         }

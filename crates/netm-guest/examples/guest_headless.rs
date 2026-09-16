@@ -204,6 +204,14 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                GuestEvent::LocalEgress(iface) => tracing::info!(
+                    "local egress: {}",
+                    iface.unwrap_or_else(|| "unknown".into())
+                ),
+                GuestEvent::LinkSpeed(s) => tracing::info!(
+                    "link capacity (Type-C, not Internet): {}",
+                    s.summary()
+                ),
                 GuestEvent::Log(m) => tracing::info!("{m}"),
                 GuestEvent::Error(m) => tracing::error!("{m}"),
             }

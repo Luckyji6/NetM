@@ -22,6 +22,9 @@
 //! | 4    | `Ping`      | 8 bytes big-endian `u64`                            |
 //! | 5    | `Pong`      | 8 bytes big-endian `u64`                            |
 //! | 6    | `Bye`       | empty                                               |
+//! | 7    | `SpeedChunk`| raw bulk payload (link speed test, not an IP packet)|
+//! | 8    | `SpeedDone` | 8 bytes big-endian `u64` (bytes the sender pushed)  |
+//! | 9    | `SpeedResult` | 16 bytes: `bytes` then `nanos`, both big-endian `u64` |
 //!
 //! Handshake: the guest sends `Hello`, the host answers `Hello` followed by
 //! `Config`; afterwards both sides exchange `IpPacket`, `Ping`/`Pong` and
@@ -48,6 +51,9 @@ const TYPE_IP_PACKET: u8 = 3;
 const TYPE_PING: u8 = 4;
 const TYPE_PONG: u8 = 5;
 const TYPE_BYE: u8 = 6;
+const TYPE_SPEED_CHUNK: u8 = 7;
+const TYPE_SPEED_DONE: u8 = 8;
+const TYPE_SPEED_RESULT: u8 = 9;
 
 /// Tunnel addressing handed from host to guest in the `Config` frame.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -93,6 +99,13 @@ pub enum Frame {
     Pong(u64),
     /// Orderly shutdown notice.
     Bye,
+    /// One chunk of a link-capacity burst (not forwarded to the TUN).
+    SpeedChunk(Bytes),
+    /// Sender finished its burst; payload is the number of payload bytes it
+    /// pushed (not counting this frame).
+    SpeedDone(u64),
+    /// Receiver's measurement of the burst it just took in.
+    SpeedResult { bytes: u64, nanos: u64 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -171,6 +184,14 @@ impl FrameCodec {
             Frame::Ping(t) => (TYPE_PING, Bytes::copy_from_slice(&t.to_be_bytes())),
             Frame::Pong(t) => (TYPE_PONG, Bytes::copy_from_slice(&t.to_be_bytes())),
             Frame::Bye => (TYPE_BYE, Bytes::new()),
+            Frame::SpeedChunk(b) => (TYPE_SPEED_CHUNK, b.clone()),
+            Frame::SpeedDone(n) => (TYPE_SPEED_DONE, Bytes::copy_from_slice(&n.to_be_bytes())),
+            Frame::SpeedResult { bytes, nanos } => {
+                let mut v = [0u8; 16];
+                v[..8].copy_from_slice(&bytes.to_be_bytes());
+                v[8..].copy_from_slice(&nanos.to_be_bytes());
+                (TYPE_SPEED_RESULT, Bytes::copy_from_slice(&v))
+            }
         })
     }
 
@@ -214,6 +235,34 @@ impl FrameCodec {
                     });
                 }
                 Ok(Frame::Bye)
+            }
+            TYPE_SPEED_CHUNK => Ok(Frame::SpeedChunk(payload)),
+            TYPE_SPEED_DONE => {
+                if payload.len() != 8 {
+                    return Err(FrameError::PayloadLength {
+                        kind,
+                        len: payload.len(),
+                    });
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&payload);
+                Ok(Frame::SpeedDone(u64::from_be_bytes(arr)))
+            }
+            TYPE_SPEED_RESULT => {
+                if payload.len() != 16 {
+                    return Err(FrameError::PayloadLength {
+                        kind,
+                        len: payload.len(),
+                    });
+                }
+                let mut bytes = [0u8; 8];
+                let mut nanos = [0u8; 8];
+                bytes.copy_from_slice(&payload[..8]);
+                nanos.copy_from_slice(&payload[8..]);
+                Ok(Frame::SpeedResult {
+                    bytes: u64::from_be_bytes(bytes),
+                    nanos: u64::from_be_bytes(nanos),
+                })
             }
             other => Err(FrameError::UnknownType(other)),
         }
@@ -298,6 +347,12 @@ mod tests {
             Frame::Ping(u64::MAX),
             Frame::Pong(0xdead_beef_cafe_babe),
             Frame::Bye,
+            Frame::SpeedChunk(Bytes::from_static(&[7; 16])),
+            Frame::SpeedDone(1_048_576),
+            Frame::SpeedResult {
+                bytes: 1_048_576,
+                nanos: 12_345_678,
+            },
         ]
     }
 

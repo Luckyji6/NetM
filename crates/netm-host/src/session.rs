@@ -84,6 +84,9 @@ fn frame_kind(f: &Frame) -> &'static str {
         Frame::Ping(_) => "Ping",
         Frame::Pong(_) => "Pong",
         Frame::Bye => "Bye",
+        Frame::SpeedChunk(_) => "SpeedChunk",
+        Frame::SpeedDone(_) => "SpeedDone",
+        Frame::SpeedResult { .. } => "SpeedResult",
     }
 }
 
@@ -180,7 +183,37 @@ pub async fn run_session<T: Transport>(
         ))
         .await;
 
-    let reason = pump(framed, &shared, cancel).await;
+    let pending = match netm_proto::speed::run_as_responder(
+        &mut framed,
+        netm_proto::speed::Params::default(),
+    )
+    .await
+    {
+        Ok(netm_proto::speed::ResponderOutcome::Measured(speed)) => {
+            tracing::info!(summary = %speed.summary(), "link capacity");
+            shared.events.send(HostEvent::LinkSpeed(speed)).await;
+            None
+        }
+        Ok(netm_proto::speed::ResponderOutcome::Skipped { pending }) => pending,
+        Err(e) => {
+            shared
+                .events
+                .log(format!(
+                    "guest \"{name}\" ({peer}) disconnected: speed test: {e}"
+                ))
+                .await;
+            shared
+                .events
+                .send(HostEvent::GuestDisconnected {
+                    peer,
+                    reason: format!("speed test: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let reason = pump(framed, pending, &shared, cancel).await;
 
     shared
         .events
@@ -190,6 +223,42 @@ pub async fn run_session<T: Transport>(
         .events
         .send(HostEvent::GuestDisconnected { peer, reason })
         .await;
+}
+
+/// Handle one guest frame. `Some` is a disconnect reason.
+fn ingest_frame(
+    frame: Frame,
+    shared: &Arc<Shared>,
+    to_stack: &mpsc::Sender<Bytes>,
+    ctrl_tx: &mpsc::Sender<Frame>,
+    dropped_packets: &AtomicUsize,
+    missed_pings: &mut u32,
+) -> Option<String> {
+    match frame {
+        Frame::IpPacket(pkt) => {
+            shared.meter.record_rx(pkt.len());
+            if to_stack.try_send(pkt).is_err() {
+                let n = dropped_packets.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::warn!(dropped = n, "stack queue full, dropping guest packets");
+                }
+            }
+            None
+        }
+        Frame::Ping(t) => {
+            let _ = ctrl_tx.try_send(Frame::Pong(t));
+            None
+        }
+        Frame::Pong(_) => {
+            *missed_pings = 0;
+            None
+        }
+        Frame::Bye => Some("guest sent Bye".into()),
+        other => {
+            tracing::debug!(kind = frame_kind(&other), "ignoring unexpected frame");
+            None
+        }
+    }
 }
 
 fn stack_config(shared: &Shared) -> IpStackConfig {
@@ -209,6 +278,7 @@ fn stack_config(shared: &Shared) -> IpStackConfig {
 /// The frame pump; returns the disconnect reason.
 async fn pump<T: Transport>(
     framed: FramedTransport<T>,
+    pending: Option<Frame>,
     shared: &Arc<Shared>,
     cancel: CancellationToken,
 ) -> String {
@@ -231,28 +301,41 @@ async fn pump<T: Transport>(
     let dropped_packets = AtomicUsize::new(0);
     let mut unknown_network: u64 = 0;
 
+    if let Some(frame) = pending {
+        if let Some(reason) = ingest_frame(
+            frame,
+            shared,
+            &to_stack,
+            &ctrl_tx,
+            &dropped_packets,
+            &mut missed_pings,
+        ) {
+            flows_cancel.cancel();
+            let _ = ctrl_tx.try_send(Frame::Bye);
+            drop(ctrl_tx);
+            drop(to_stack);
+            drop(stack);
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
+            return reason;
+        }
+    }
+
     let reason = loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break "host shutting down".to_string(),
             frame = source.next() => match frame {
-                Some(Ok(Frame::IpPacket(pkt))) => {
-                    shared.meter.record_rx(pkt.len());
-                    if to_stack.try_send(pkt).is_err() {
-                        // Stack is backed up: dropping IP packets is legitimate.
-                        let n = dropped_packets.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_power_of_two() {
-                            tracing::warn!(dropped = n, "stack queue full, dropping guest packets");
-                        }
+                Some(Ok(frame)) => {
+                    if let Some(reason) = ingest_frame(
+                        frame,
+                        shared,
+                        &to_stack,
+                        &ctrl_tx,
+                        &dropped_packets,
+                        &mut missed_pings,
+                    ) {
+                        break reason;
                     }
-                }
-                Some(Ok(Frame::Ping(t))) => {
-                    let _ = ctrl_tx.try_send(Frame::Pong(t));
-                }
-                Some(Ok(Frame::Pong(_))) => missed_pings = 0,
-                Some(Ok(Frame::Bye)) => break "guest sent Bye".to_string(),
-                Some(Ok(other)) => {
-                    tracing::debug!(kind = frame_kind(&other), "ignoring unexpected frame");
                 }
                 Some(Err(e)) => break format!("read error: {e}"),
                 None => break "connection closed by guest".to_string(),

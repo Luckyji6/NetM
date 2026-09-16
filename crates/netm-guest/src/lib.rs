@@ -21,9 +21,9 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Platform support: macOS (utun via tun-rs, `route`/`scutil`); Linux and
-//! Windows compile but return "not yet supported" from the platform
-//! configurator.
+//! Platform support: macOS is the primary target (utun, `route`, `scutil`).
+//! Linux (`ip` / `resolvectl`) and Windows (Wintun / `netsh` / `route`) are
+//! implemented but have not been run on real machines yet.
 
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -146,6 +146,13 @@ pub enum GuestEvent {
         /// Bits per second out of the tunnel (host → guest).
         rx_bps: f64,
     },
+    /// Interface the system's default route points at while no tunnel is up
+    /// (`en0` for Wi-Fi), i.e. where the user's traffic goes now. Sent at
+    /// startup and after every teardown; `None` when it cannot be
+    /// determined.
+    LocalEgress(Option<String>),
+    /// One-shot Type-C / Thunderbolt link-capacity probe (not Internet).
+    LinkSpeed(netm_proto::LinkSpeed),
     Log(String),
     Error(String),
 }
@@ -161,7 +168,7 @@ pub enum GuestCommand {
 
 /// Whether the guest needs root/administrator privileges on this OS.
 pub fn requires_root() -> bool {
-    cfg!(unix)
+    cfg!(unix) || cfg!(windows)
 }
 
 /// Run the guest until [`GuestCommand::Shutdown`] is received (or, with

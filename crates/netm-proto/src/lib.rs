@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod frame;
 pub mod link;
 pub mod privilege;
+pub mod speed;
 pub mod stats;
 pub mod transport;
 
@@ -34,5 +35,6 @@ pub const DEFAULT_MTU: u16 = 1400;
 
 pub use frame::{framed, Frame, FrameCodec, FrameError, FramedTransport, TunnelConfig};
 pub use link::{list_candidate_interfaces, LinkInterface, LinkKind};
+pub use speed::LinkSpeed;
 pub use stats::{Counters, RateMeter};
 pub use transport::Transport;

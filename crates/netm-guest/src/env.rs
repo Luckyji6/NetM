@@ -20,6 +20,16 @@ pub(crate) trait GuestEnv: Send + 'static {
     /// Candidate link interfaces, sorted by preference.
     fn list_interfaces(&mut self) -> impl Future<Output = io::Result<Vec<LinkInterface>>> + Send;
 
+    /// Whether `iface` still has a carrier. Polled several times a second
+    /// while the tunnel is up, so it must not spawn subprocesses.
+    ///
+    /// `None` when the platform cannot tell (the caller then keeps the tunnel
+    /// up and relies on keep-alives).
+    fn link_active(&mut self, iface: &str) -> Option<bool>;
+
+    /// Interface the default route points at while no tunnel is up.
+    fn local_egress(&mut self) -> impl Future<Output = Option<String>> + Send;
+
     /// Multicast-probe `iface` for a host.
     fn probe(
         &mut self,
@@ -57,6 +67,17 @@ impl GuestEnv for RealEnv {
         tokio::task::spawn_blocking(netm_proto::list_candidate_interfaces)
             .await
             .map_err(|e| io::Error::other(format!("interface listing task failed: {e}")))?
+    }
+
+    fn link_active(&mut self, iface: &str) -> Option<bool> {
+        netm_proto::link::is_link_active(iface).ok()
+    }
+
+    async fn local_egress(&mut self) -> Option<String> {
+        // Spawns `route`/`ip`: keep it off the async threads.
+        tokio::task::spawn_blocking(crate::platform::default_egress_interface)
+            .await
+            .unwrap_or(None)
     }
 
     async fn probe(

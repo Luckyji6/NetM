@@ -167,8 +167,10 @@ fn render_guest(app: &App, m: &GuestModel, frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [status, middle, thr, log] = Layout::vertical([
+    let warning = m.egress_warning();
+    let [status, banner, middle, thr, log] = Layout::vertical([
         Constraint::Length(3),
+        Constraint::Length(if warning.is_some() { 3 } else { 0 }),
         Constraint::Length(9),
         Constraint::Length(4),
         Constraint::Min(4),
@@ -176,6 +178,9 @@ fn render_guest(app: &App, m: &GuestModel, frame: &mut Frame, area: Rect) {
     .areas(inner);
 
     render_guest_status(app, m, frame, status);
+    if let Some(text) = warning {
+        render_egress_warning(&text, frame, banner);
+    }
 
     let [ifaces, conn] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(middle);
@@ -226,6 +231,22 @@ fn render_guest_status(app: &App, m: &GuestModel, frame: &mut Frame, area: Rect)
         .title(" 状态 ")
         .border_style(Style::new().fg(color));
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+/// Banner shown after the tunnel went away, so the user is never left
+/// guessing whether their machine still has network.
+fn render_egress_warning(text: &str, frame: &mut Frame, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let block = Block::bordered()
+        .title(" 注意 ")
+        .border_style(Style::new().fg(WARN));
+    let line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(text, Style::new().fg(WARN).add_modifier(Modifier::BOLD)),
+    ]);
+    frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
 fn render_interfaces(
@@ -328,6 +349,16 @@ fn render_guest_connection(app: &App, m: &GuestModel, frame: &mut Frame, area: R
             ));
             pairs.push(("MTU".into(), config.mtu.to_string()));
             pairs.push(("已连接".into(), age(*since)));
+            if let Some(s) = m.link_speed {
+                pairs.push((
+                    "线路".into(),
+                    format!(
+                        "↑ {}  ↓ {}",
+                        crate::format::fmt_bps(s.up_bps),
+                        crate::format::fmt_bps(s.down_bps)
+                    ),
+                ));
+            }
             for (k, v) in &app.guest_summary {
                 if k == "路由" || k == "系统 DNS" {
                     pairs.push((k.clone(), v.clone()));
@@ -435,16 +466,26 @@ fn render_host_header(app: &App, m: &HostModel, frame: &mut Frame, area: Rect) {
 
 fn render_host_guest(m: &HostModel, frame: &mut Frame, area: Rect) {
     let (color, pairs): (Color, Vec<(String, String)>) = match &m.guest {
-        Some(g) => (
-            OK,
-            vec![
+        Some(g) => {
+            let mut pairs = vec![
                 ("状态".into(), "已连接".into()),
                 ("名称".into(), g.name.clone()),
                 ("对端".into(), g.peer.to_string()),
                 ("分配 IP".into(), g.assigned_ip.to_string()),
                 ("连接时长".into(), age(g.connected_at)),
-            ],
-        ),
+            ];
+            if let Some(s) = m.link_speed {
+                pairs.push((
+                    "线路".into(),
+                    format!(
+                        "↑ {}  ↓ {}",
+                        crate::format::fmt_bps(s.up_bps),
+                        crate::format::fmt_bps(s.down_bps)
+                    ),
+                ));
+            }
+            (OK, pairs)
+        }
         None => {
             let mut p = vec![("状态".into(), "等待客机连接".into())];
             if let Some(r) = &m.last_disconnect {

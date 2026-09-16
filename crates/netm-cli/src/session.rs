@@ -243,6 +243,14 @@ fn describe_host(ev: &HostEvent) -> Option<(Level, String)> {
         HostEvent::FlowOpened(_) | HostEvent::FlowClosed { .. } | HostEvent::Stats { .. } => {
             return None
         }
+        HostEvent::LinkSpeed(s) => (
+            Level::Info,
+            format!(
+                "线路测速（Type-C，不是互联网）：上行 {}（客机→宿主机），下行 {}（宿主机→客机）",
+                crate::format::fmt_bps(s.up_bps),
+                crate::format::fmt_bps(s.down_bps)
+            ),
+        ),
         HostEvent::Log(m) => (Level::Info, m.clone()),
         HostEvent::Error(m) => (Level::Error, m.clone()),
     })
@@ -287,6 +295,21 @@ fn describe_guest(ev: &GuestEvent) -> Option<(Level, String)> {
             )
         }
         GuestEvent::Stats { .. } => return None,
+        GuestEvent::LocalEgress(iface) => (
+            Level::Info,
+            match iface {
+                Some(name) => format!("本机网络出口：{name}"),
+                None => "本机网络出口：未知".into(),
+            },
+        ),
+        GuestEvent::LinkSpeed(s) => (
+            Level::Info,
+            format!(
+                "线路测速（Type-C，不是互联网）：上行 {}（客机→宿主机），下行 {}（宿主机→客机）",
+                crate::format::fmt_bps(s.up_bps),
+                crate::format::fmt_bps(s.down_bps)
+            ),
+        ),
         GuestEvent::Log(m) => (Level::Info, m.clone()),
         GuestEvent::Error(m) => (Level::Error, m.clone()),
     })
