@@ -14,3 +14,21 @@ path = "src/main.rs"
 netm-proto = { workspace = true }
 netm-host = { workspace = true }
 netm-guest = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+toml = "1.1.6"
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+futures.workspace = true
+ipnet = "2.12.2"
+hostname.workspace = true
+
+[target."cfg(unix)".dependencies]
+nix = { workspace = true, features = ["user", "fs"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
