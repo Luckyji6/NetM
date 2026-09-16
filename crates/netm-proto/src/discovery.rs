@@ -1,9 +1,11 @@
 //! IPv6 link-local multicast discovery.
 //!
 //! The guest multicasts a [`DiscoveryMessage::Probe`] to `[ff02::1%ifindex]:`
-//! [`DISCOVERY_PORT`] on a candidate interface; the host, which has a UDP
-//! socket bound to `[::]:`[`DISCOVERY_PORT`], answers every valid probe with a
-//! unicast [`DiscoveryMessage::Offer`] sent back to the probe's source address.
+//! [`DISCOVERY_PORT`] on a candidate interface, and also unicasts the same
+//! probe to every link-local neighbour (USB Ethernet / plain Type-C often
+//! drops `ff02::1`). The host, which has a UDP socket bound to
+//! `[::]:`[`DISCOVERY_PORT`], answers every valid probe with a unicast
+//! [`DiscoveryMessage::Offer`] sent back to the probe's source address.
 //! Because the offer is sent to a link-local destination, the kernel sources it
 //! from the host's own `fe80::` address on that link, so the guest learns the
 //! host address simply from `recv_from` (the kernel also fills in the
@@ -333,7 +335,33 @@ pub async fn probe(iface: &LinkInterface, timeout: Duration) -> io::Result<Optio
     socket.bind(&SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)).into())?;
     let std_socket: std::net::UdpSocket = socket.into();
     let socket = UdpSocket::from_std(std_socket)?;
-    probe_with_socket(&socket, iface, MULTICAST_GROUP, DISCOVERY_PORT, timeout).await
+    let mut targets = vec![SocketAddrV6::new(
+        MULTICAST_GROUP,
+        DISCOVERY_PORT,
+        0,
+        iface.index,
+    )];
+    // USB Ethernet (plain Type-C) often silently drops ff02::1. Unicast to
+    // every link-local neighbour as well — the kernel neighbour table is
+    // populated even when multicast discovery is not.
+    let iface_for_neigh = iface.clone();
+    match tokio::task::spawn_blocking(move || crate::link::list_neighbors(&iface_for_neigh))
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(format!("neighbour listing failed: {e}"))))
+    {
+        Ok(list) => {
+            for n in list {
+                if let Some(ip) = n.v6 {
+                    let dest = SocketAddrV6::new(ip, DISCOVERY_PORT, 0, iface.index);
+                    if !targets.contains(&dest) {
+                        targets.push(dest);
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::debug!(iface = %iface.name, error = %e, "neighbour table unavailable"),
+    }
+    probe_targets(&socket, iface, &targets, timeout).await
 }
 
 /// Same as [`probe`] but with an explicit target address/port and caller-owned
@@ -345,18 +373,34 @@ pub async fn probe_with_socket(
     target_port: u16,
     timeout: Duration,
 ) -> io::Result<Option<Discovered>> {
+    let target = SocketAddrV6::new(target_ip, target_port, 0, iface.index);
+    probe_targets(socket, iface, &[target], timeout).await
+}
+
+async fn probe_targets(
+    socket: &UdpSocket,
+    iface: &LinkInterface,
+    targets: &[SocketAddrV6],
+    timeout: Duration,
+) -> io::Result<Option<Discovered>> {
+    if targets.is_empty() {
+        return Ok(None);
+    }
     let nonce = random_nonce();
     let probe = DiscoveryMessage::Probe {
         version: PROTOCOL_VERSION,
         nonce,
     }
     .encode()?;
-    let target = SocketAddrV6::new(target_ip, target_port, 0, iface.index);
 
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; MAX_DATAGRAM];
     loop {
-        socket.send_to(&probe, target).await?;
+        for target in targets {
+            if let Err(e) = socket.send_to(&probe, SocketAddr::V6(*target)).await {
+                tracing::debug!(%target, error = %e, "discovery send failed");
+            }
+        }
         let resend_at = Instant::now() + PROBE_RESEND_INTERVAL;
         loop {
             let now = Instant::now();

@@ -72,6 +72,7 @@ impl Drop for FakeConfigurator {
 struct FakeEnv {
     ifaces: Arc<Mutex<Vec<LinkInterface>>>,
     discovered: Option<Discovered>,
+    neighbor: Option<SocketAddr>,
     links: Arc<Mutex<VecDeque<io::Result<DuplexStream>>>>,
     tuns: Arc<Mutex<VecDeque<FakeTun>>>,
     cfg_log: Log,
@@ -108,6 +109,10 @@ impl GuestEnv for FakeEnv {
     ) -> io::Result<Option<Discovered>> {
         *self.probes.lock().unwrap() += 1;
         Ok(self.discovered.clone())
+    }
+
+    async fn neighbor_target(&mut self, _iface: &LinkInterface) -> Option<SocketAddr> {
+        self.neighbor
     }
 
     async fn connect(&mut self, _addr: SocketAddr, _timeout: Duration) -> io::Result<DuplexStream> {
@@ -268,6 +273,15 @@ impl Harness {
         ifaces: Vec<LinkInterface>,
         discovered: Option<Discovered>,
     ) -> Harness {
+        Self::start_with_neighbor(cfg, ifaces, discovered, None)
+    }
+
+    fn start_with_neighbor(
+        cfg: GuestConfig,
+        ifaces: Vec<LinkInterface>,
+        discovered: Option<Discovered>,
+        neighbor: Option<SocketAddr>,
+    ) -> Harness {
         let ifaces = Arc::new(Mutex::new(ifaces));
         let links = Arc::new(Mutex::new(VecDeque::new()));
         let tuns = Arc::new(Mutex::new(VecDeque::new()));
@@ -276,6 +290,7 @@ impl Harness {
         let env = FakeEnv {
             ifaces: ifaces.clone(),
             discovered,
+            neighbor,
             links: links.clone(),
             tuns: tuns.clone(),
             cfg_log: cfg_log.clone(),
@@ -545,6 +560,28 @@ async fn waits_for_link_and_shuts_down_quickly() {
     h.finish().await.unwrap();
     assert!(t0.elapsed() < Duration::from_millis(300));
     assert_eq!(*probes.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn silent_multicast_falls_back_to_neighbour() {
+    let neigh = SocketAddr::from(host_addr());
+    let mut h = Harness::start_with_neighbor(
+        auto_cfg(false),
+        vec![bridge_iface(true)],
+        None,
+        Some(neigh),
+    );
+    let _tun = h.add_tun("faketun-usb");
+    let _host = Harness::add_link(&h.links, TunnelConfig::default());
+    let s = h
+        .wait_state(|s| matches!(s, GuestState::Connected { .. }))
+        .await;
+    assert!(
+        matches!(s, GuestState::Connected { host, .. } if host == neigh),
+        "{s:?}"
+    );
+    h.ctrl.send(GuestCommand::Shutdown).unwrap();
+    h.finish().await.unwrap();
 }
 
 #[tokio::test]

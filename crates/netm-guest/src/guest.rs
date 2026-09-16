@@ -427,7 +427,19 @@ impl<E: GuestEnv> Guest<E> {
                             }));
                         }
                         Ok(None) => {
-                            tracing::debug!(iface = %iface.name, "no host answered");
+                            tracing::debug!(iface = %iface.name, "no host answered multicast");
+                            if let Some(addr) = self.env.neighbor_target(&iface).await {
+                                self.log(format!(
+                                    "组播未应答，改为直连 {} 上的邻居 {addr}",
+                                    iface.name
+                                ))
+                                .await;
+                                return Ok(Some(Target {
+                                    addr,
+                                    host_name: None,
+                                    link_iface: Some(iface.name),
+                                }));
+                            }
                         }
                         Err(e) => {
                             tracing::debug!(iface = %iface.name, error = %e, "probe failed");

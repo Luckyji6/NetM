@@ -117,6 +117,177 @@ pub fn list_all_interfaces() -> io::Result<Vec<LinkInterface>> {
     Ok(list)
 }
 
+/// A neighbour seen on a candidate link (the other end of a Type-C cable).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Neighbor {
+    /// Link-local IPv6, if the NDP table has one.
+    pub v6: Option<Ipv6Addr>,
+    /// IPv4 (often a `169.254/16` auto address on USB Ethernet).
+    pub v4: Option<std::net::Ipv4Addr>,
+}
+
+/// Peers on `iface` according to the kernel neighbour tables.
+///
+/// USB Ethernet (plain Type-C, not Thunderbolt) frequently drops `ff02::1`
+/// multicast, so discovery must unicast to these addresses instead. The
+/// table is usually populated as soon as IPv6 DAD finishes on the cable.
+pub fn list_neighbors(iface: &LinkInterface) -> io::Result<Vec<Neighbor>> {
+    let mut out = Vec::new();
+    for ip in neighbor_v6(&iface.name)? {
+        if iface.link_local_v6 == Some(ip) {
+            continue;
+        }
+        out.push(Neighbor {
+            v6: Some(ip),
+            v4: None,
+        });
+    }
+    for ip in neighbor_v4(&iface.name)? {
+        if out.iter().any(|n| n.v4 == Some(ip)) {
+            continue;
+        }
+        // Pair a leftover IPv4 with a v6-only row if we can; otherwise
+        // append. Pairing is best-effort — a USB cable has one peer.
+        if let Some(row) = out.iter_mut().find(|n| n.v4.is_none()) {
+            row.v4 = Some(ip);
+        } else {
+            out.push(Neighbor {
+                v6: None,
+                v4: Some(ip),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Default data-plane address of the first neighbour on `iface`, used when
+/// multicast discovery stays silent (USB Ethernet / plain Type-C).
+pub fn neighbor_data_addr(iface: &LinkInterface) -> Option<std::net::SocketAddr> {
+    use std::net::{SocketAddr, SocketAddrV6};
+    let neigh = list_neighbors(iface).ok()?;
+    for n in neigh {
+        if let Some(ip) = n.v6 {
+            return Some(SocketAddr::V6(SocketAddrV6::new(
+                ip,
+                crate::DATA_PORT,
+                0,
+                iface.index,
+            )));
+        }
+        if let Some(ip) = n.v4 {
+            return Some(SocketAddr::from((ip, crate::DATA_PORT)));
+        }
+    }
+    None
+}
+
+fn neighbor_v6(iface: &str) -> io::Result<Vec<Ipv6Addr>> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("ndp").arg("-an").output()?;
+        Ok(parse_ndp_an(
+            &String::from_utf8_lossy(&out.stdout),
+            iface,
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let out = std::process::Command::new("ip")
+            .args(["-6", "neigh", "show", "dev", iface])
+            .output()?;
+        Ok(parse_ip_neigh(&String::from_utf8_lossy(&out.stdout)))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = iface;
+        Ok(Vec::new())
+    }
+}
+
+fn neighbor_v4(iface: &str) -> io::Result<Vec<std::net::Ipv4Addr>> {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("arp").arg("-an").output()?;
+        Ok(parse_arp_an(
+            &String::from_utf8_lossy(&out.stdout),
+            iface,
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = iface;
+        Ok(Vec::new())
+    }
+}
+
+/// Parse `ndp -an` (macOS / BSD). Exported for tests.
+pub fn parse_ndp_an(text: &str, iface: &str) -> Vec<Ipv6Addr> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 3 || cols[0].eq_ignore_ascii_case("Neighbor") {
+            continue;
+        }
+        if cols[2] != iface {
+            continue;
+        }
+        let mac = cols[1].to_ascii_lowercase();
+        if mac == "(incomplete)" || mac == "incomplete" {
+            continue;
+        }
+        let addr = cols[0].split('%').next().unwrap_or("");
+        if let Ok(ip) = addr.parse::<Ipv6Addr>() {
+            if ip.is_unicast_link_local() {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+/// Parse `ip -6 neigh show dev <iface>` (Linux).
+pub fn parse_ip_neigh(text: &str) -> Vec<Ipv6Addr> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        let failed = cols.iter().any(|c| *c == "FAILED" || *c == "INCOMPLETE");
+        if failed {
+            continue;
+        }
+        if let Ok(ip) = cols[0].parse::<Ipv6Addr>() {
+            if ip.is_unicast_link_local() {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+/// Parse `arp -an`. Lines look like
+/// `? (169.254.1.2) at c6:cf:36:60:31:92 on en6 ifscope [ethernet]`.
+pub fn parse_arp_an(text: &str, iface: &str) -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if !line.split_whitespace().any(|c| c == iface) {
+            continue;
+        }
+        if line.contains("incomplete") {
+            continue;
+        }
+        let Some(start) = line.find('(') else { continue };
+        let Some(end) = line[start + 1..].find(')') else {
+            continue;
+        };
+        if let Ok(ip) = line[start + 1..start + 1 + end].parse() {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // getifaddrs-based state collection (all Unix)
 // ---------------------------------------------------------------------------
@@ -961,6 +1132,29 @@ mod tests {
         for l in &list {
             assert!(!l.name.is_empty());
         }
+    }
+
+    #[test]
+    fn parses_ndp_and_arp_for_usb_ethernet() {
+        let ndp = "\
+Neighbor                                 Linklayer Address  Netif Expire    St Flgs Prbs
+fe80::1c72:593f:549e:9a67%en6           c6:cf:36:60:31:92    en6 23h58m44s S
+fe80::1cb5:9c21:86d:c9da%en6            c6:cf:36:60:31:6d    en6 permanent R
+fe80::1%lo0                             (incomplete)         lo0 expired    N
+";
+        let v6 = parse_ndp_an(ndp, "en6");
+        assert_eq!(v6.len(), 2);
+        assert!(v6.contains(&"fe80::1c72:593f:549e:9a67".parse().unwrap()));
+
+        let arp = "? (169.254.10.20) at c6:cf:36:60:31:92 on en6 ifscope [ethernet]\n? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]\n";
+        let v4 = parse_arp_an(arp, "en6");
+        assert_eq!(v4, vec!["169.254.10.20".parse::<std::net::Ipv4Addr>().unwrap()]);
+
+        let linux = "fe80::1c72:593f:549e:9a67 lladdr c6:cf:36:60:31:92 REACHABLE\nfe80::abcd FAILED\n";
+        assert_eq!(
+            parse_ip_neigh(linux),
+            vec!["fe80::1c72:593f:549e:9a67".parse::<Ipv6Addr>().unwrap()]
+        );
     }
 
     #[test]

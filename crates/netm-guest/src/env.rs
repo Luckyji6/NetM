@@ -37,6 +37,15 @@ pub(crate) trait GuestEnv: Send + 'static {
         timeout: Duration,
     ) -> impl Future<Output = io::Result<Option<Discovered>>> + Send;
 
+    /// When multicast (and unicast UDP) discovery stays silent, the other
+    /// Mac is often still in the neighbour table. Return its data-plane
+    /// address (`fe80` / `169.254` on [`netm_proto::DATA_PORT`]) so the
+    /// guest can TCP-connect without an Offer.
+    fn neighbor_target(
+        &mut self,
+        iface: &LinkInterface,
+    ) -> impl Future<Output = Option<SocketAddr>> + Send;
+
     /// Open the data connection to the host.
     fn connect(
         &mut self,
@@ -86,6 +95,14 @@ impl GuestEnv for RealEnv {
         timeout: Duration,
     ) -> io::Result<Option<Discovered>> {
         netm_proto::discovery::probe(iface, timeout).await
+    }
+
+    async fn neighbor_target(&mut self, iface: &LinkInterface) -> Option<SocketAddr> {
+        let iface = iface.clone();
+        tokio::task::spawn_blocking(move || netm_proto::neighbor_data_addr(&iface))
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn connect(

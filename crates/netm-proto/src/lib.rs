@@ -34,7 +34,10 @@ pub const DATA_PORT: u16 = 27778;
 pub const DEFAULT_MTU: u16 = 1400;
 
 pub use frame::{framed, Frame, FrameCodec, FrameError, FramedTransport, TunnelConfig};
-pub use link::{list_candidate_interfaces, LinkInterface, LinkKind};
+pub use link::{
+    list_candidate_interfaces, list_neighbors, neighbor_data_addr, LinkInterface, LinkKind,
+    Neighbor,
+};
 pub use speed::LinkSpeed;
 pub use stats::{Counters, RateMeter};
 pub use transport::Transport;
