@@ -22,6 +22,10 @@ pub trait TunIo: Send + Sync + 'static {
     fn name(&self) -> &str;
 }
 
+/// Name of the Wintun adapter created on Windows (also what shows up in
+/// `netsh` / the network connections panel).
+pub const WINDOWS_ADAPTER_NAME: &str = "NetM";
+
 /// [`TunIo`] backed by a real tun-rs device.
 pub struct TunDevice {
     dev: tun_rs::AsyncDevice,
@@ -32,19 +36,31 @@ impl TunDevice {
     /// Create the TUN interface for `cfg`: address `guest_ip`, point-to-point
     /// destination `gateway_ip`, netmask from `prefix_len`, MTU `mtu`.
     ///
-    /// tun-rs assigns the address via `SIOCAIFADDR` and (on macOS/BSD, with
-    /// its default `associate_route = true`) installs the route for the
-    /// tunnel subnet itself; the `/1` split routes and DNS are added by the
-    /// platform configurator afterwards.
+    /// On Unix tun-rs assigns the address via `SIOCAIFADDR`/`SIOCSIFADDR`
+    /// and (on macOS/BSD, with its default `associate_route = true`) installs
+    /// the route for the tunnel subnet itself; the `/1` split routes and DNS
+    /// are added by the platform configurator afterwards.
+    ///
+    /// On Windows the adapter is a Wintun adapter named
+    /// [`WINDOWS_ADAPTER_NAME`] (`wintun.dll` must sit next to the executable
+    /// or on the DLL search path). The point-to-point destination is **not**
+    /// passed there: tun-rs turns it into a `0.0.0.0/0` default route on
+    /// Windows, which would defeat the split routing (and break
+    /// [`crate::RouteMode::Custom`]). Address and MTU are still applied by
+    /// tun-rs through `iphlpapi`.
     ///
     /// The device is built synchronously (ioctls; safe to call from
     /// `spawn_blocking`); use [`TunDevice::into_async`] on a runtime thread
     /// to register it with tokio.
     pub fn create_sync(cfg: &TunnelConfig) -> io::Result<tun_rs::SyncDevice> {
-        tun_rs::DeviceBuilder::new()
-            .ipv4(cfg.guest_ip, cfg.prefix_len, Some(cfg.gateway_ip))
-            .mtu(cfg.mtu)
-            .build_sync()
+        let builder = tun_rs::DeviceBuilder::new().mtu(cfg.mtu);
+        #[cfg(windows)]
+        let builder = builder
+            .name(WINDOWS_ADAPTER_NAME)
+            .ipv4(cfg.guest_ip, cfg.prefix_len, None);
+        #[cfg(not(windows))]
+        let builder = builder.ipv4(cfg.guest_ip, cfg.prefix_len, Some(cfg.gateway_ip));
+        builder.build_sync()
     }
 
     /// Register a device built by [`TunDevice::create_sync`] with the current

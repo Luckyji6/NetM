@@ -14,11 +14,12 @@ use netm_proto::TunnelConfig;
 
 use crate::RouteMode;
 
-#[cfg(target_os = "linux")]
+// The Linux and Windows configurators only drive external commands through
+// `CommandRunner`, so they compile (and are unit-tested) everywhere; only
+// `system_configurator` picks one per OS.
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
-#[cfg(windows)]
 pub mod windows;
 
 /// Applies and reverts the OS-level network configuration for a tunnel.
@@ -184,11 +185,11 @@ pub fn system_configurator() -> Box<dyn PlatformConfigurator> {
     }
     #[cfg(target_os = "linux")]
     {
-        Box::new(linux::LinuxConfigurator::default())
+        Box::new(linux::LinuxConfigurator::new(SystemRunner))
     }
     #[cfg(windows)]
     {
-        Box::new(windows::WindowsConfigurator::default())
+        Box::new(windows::WindowsConfigurator::new(SystemRunner))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
