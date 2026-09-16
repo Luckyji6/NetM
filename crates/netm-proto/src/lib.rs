@@ -22,7 +22,11 @@ pub mod transport;
 
 /// Protocol version carried in `Hello` frames and discovery messages. Peers
 /// with a different version must not talk to each other.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// Version 2 adds the link-capacity frames (types 7-9). This must differ from
+/// the original protocol: a v1 peer cannot decode those frames and would
+/// otherwise accept the handshake before dropping the connection.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// UDP port used for link-local multicast discovery (`ff02::1`).
 pub const DISCOVERY_PORT: u16 = 27777;

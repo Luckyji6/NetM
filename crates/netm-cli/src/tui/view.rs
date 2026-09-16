@@ -39,7 +39,10 @@ fn title_block<'a>(title: &'a str, footer: Line<'a>) -> Block<'a> {
     Block::bordered()
         .title(Line::from(vec![
             Span::raw(" "),
-            Span::styled("NetM", Style::new().fg(ACCENT).bold()),
+            Span::styled(
+                concat!("NetM v", env!("CARGO_PKG_VERSION")),
+                Style::new().fg(ACCENT).bold(),
+            ),
             Span::raw(format!(" · {title} ")),
         ]))
         .title_bottom(footer)
@@ -775,6 +778,7 @@ mod tests {
         let mut a = app();
         a.start(crate::tui::Start::Onboarding);
         let s = draw(&a, 100, 30);
+        assert!(has(&s, concat!("NetM v", env!("CARGO_PKG_VERSION"))));
         assert!(has(&s, "宿主机（服务端）"));
         assert!(has(&s, "客机"));
         assert!(has(&s, "Enter"));

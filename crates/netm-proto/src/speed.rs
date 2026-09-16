@@ -8,8 +8,9 @@
 //!    pushes its own burst the other way.
 //! 3. Guest replies [`Frame::SpeedResult`] (host → guest).
 //!
-//! An old peer that does not speak these frames simply ignores them (host)
-//! or times out (guest); the tunnel continues either way.
+//! These frames were introduced with protocol version 2. The handshake must
+//! reject older peers before a probe starts; sending them to a v1 peer would
+//! make that peer close the connection on the unknown frame type.
 
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::time::timeout;
 
-use crate::frame::{Frame, FrameError, FramedTransport};
+use crate::frame::{Frame, FrameError, FramedTransport, MAX_FRAME_SIZE};
 use crate::transport::Transport;
 
 /// Tunables of one burst. Production values fill the pipe for a fraction of
@@ -44,7 +45,11 @@ impl Default for Params {
             chunk: 32 * 1024,
             budget: Duration::from_millis(280),
             max_bytes: 16 * 1024 * 1024,
-            idle: Duration::from_millis(200),
+            // Both peers may briefly wait for their UI/log event queues after
+            // the handshake. Keep this comfortably above that scheduling
+            // jitter so the responder does not enter the packet pump while
+            // the initiator is about to start its burst.
+            idle: Duration::from_secs(1),
             timeout: Duration::from_secs(3),
         }
     }
@@ -109,18 +114,40 @@ fn bps(bytes: u64, nanos: u64) -> f64 {
     (bytes as f64) * 8.0 * 1_000_000_000.0 / (nanos as f64)
 }
 
-/// Failures of a speed probe. The tunnel is only in trouble when the
-/// connection itself died (`Io` / `Closed`).
+/// Failures of a speed probe. Transport/codec failures mean the current
+/// connection cannot safely continue; validation errors protect both sides
+/// from malformed or unbounded probe traffic.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid speed test parameters: {0}")]
+    InvalidParams(&'static str),
     #[error("speed test timed out")]
     Timeout,
     #[error("connection closed during speed test")]
     Closed,
     #[error("unexpected frame during speed test: {0}")]
     Unexpected(&'static str),
+    #[error("speed test received more than the {max} byte limit")]
+    LimitExceeded { max: u64 },
+    #[error("speed test byte count mismatch (sender {sent}, receiver {received})")]
+    ByteCountMismatch { sent: u64, received: u64 },
     #[error(transparent)]
     Codec(#[from] FrameError),
+}
+
+fn validate(params: Params) -> Result<(), Error> {
+    if params.chunk == 0 {
+        return Err(Error::InvalidParams("chunk must be greater than zero"));
+    }
+    if params.chunk >= MAX_FRAME_SIZE {
+        return Err(Error::InvalidParams(
+            "chunk must fit inside one protocol frame",
+        ));
+    }
+    if params.max_bytes == 0 {
+        return Err(Error::InvalidParams("max_bytes must be greater than zero"));
+    }
+    Ok(())
 }
 
 fn kind(f: &Frame) -> &'static str {
@@ -141,15 +168,25 @@ async fn send_burst<T: Transport>(
     framed: &mut FramedTransport<T>,
     params: Params,
 ) -> Result<u64, Error> {
-    let payload = Bytes::from(vec![0u8; params.chunk.max(1)]);
+    validate(params)?;
+    let full_payload = Bytes::from(vec![0u8; params.chunk]);
     let start = Instant::now();
     let mut sent = 0u64;
-    let chunk = payload.len() as u64;
+    let mut chunks_since_flush = 0u8;
     while sent < params.max_bytes {
-        framed.feed(Frame::SpeedChunk(payload.clone())).await?;
+        let remaining = params.max_bytes - sent;
+        let payload = if remaining < params.chunk as u64 {
+            Bytes::from(vec![0u8; remaining as usize])
+        } else {
+            full_payload.clone()
+        };
+        let chunk = payload.len() as u64;
+        framed.feed(Frame::SpeedChunk(payload)).await?;
         sent += chunk;
-        if sent.is_multiple_of(chunk * 4) {
+        chunks_since_flush += 1;
+        if chunks_since_flush == 4 {
             framed.flush().await?;
+            chunks_since_flush = 0;
         }
         if sent >= chunk && start.elapsed() >= params.budget {
             break;
@@ -183,7 +220,12 @@ async fn recv_burst<T: Transport>(
     let mut started: Option<Instant> = None;
     if let Some(p) = first {
         started = Some(Instant::now());
-        bytes += p.len() as u64;
+        bytes = (p.len() as u64)
+            .checked_add(bytes)
+            .filter(|total| *total <= params.max_bytes)
+            .ok_or(Error::LimitExceeded {
+                max: params.max_bytes,
+            })?;
     }
     loop {
         match next_frame(framed, params.timeout).await? {
@@ -191,9 +233,20 @@ async fn recv_burst<T: Transport>(
                 if started.is_none() {
                     started = Some(Instant::now());
                 }
-                bytes += p.len() as u64;
+                bytes = bytes
+                    .checked_add(p.len() as u64)
+                    .filter(|total| *total <= params.max_bytes)
+                    .ok_or(Error::LimitExceeded {
+                        max: params.max_bytes,
+                    })?;
             }
-            Frame::SpeedDone(_) => {
+            Frame::SpeedDone(sent) => {
+                if sent != bytes {
+                    return Err(Error::ByteCountMismatch {
+                        sent,
+                        received: bytes,
+                    });
+                }
                 let nanos = started.map(|s| s.elapsed().as_nanos() as u64).unwrap_or(0);
                 return Ok((bytes, nanos));
             }
@@ -211,6 +264,7 @@ pub async fn run_as_initiator<T: Transport>(
     framed: &mut FramedTransport<T>,
     params: Params,
 ) -> Result<LinkSpeed, Error> {
+    validate(params)?;
     let _sent = send_burst(framed, params).await?;
     let up = match next_frame(framed, params.timeout).await? {
         Frame::SpeedResult { bytes, nanos } => (bytes, nanos),
@@ -255,6 +309,7 @@ pub async fn run_as_responder<T: Transport>(
     framed: &mut FramedTransport<T>,
     params: Params,
 ) -> Result<ResponderOutcome, Error> {
+    validate(params)?;
     let first = match timeout(params.idle, framed.next()).await {
         Err(_) => return Ok(ResponderOutcome::Skipped { pending: None }),
         Ok(None) => return Err(Error::Closed),
@@ -321,6 +376,65 @@ mod tests {
         assert_eq!(up.up_bytes, down.up_bytes);
         assert_eq!(up.down_bytes, down.down_bytes);
         assert!(up.up_bps > 0.0 && up.down_bps > 0.0, "{}", up.summary());
+    }
+
+    #[tokio::test]
+    async fn burst_honours_non_multiple_byte_cap() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut params = Params::for_tests();
+        params.max_bytes = 2_500;
+        let initiator = tokio::spawn(async move {
+            let mut f = framed(a);
+            run_as_initiator(&mut f, params).await
+        });
+        let responder = tokio::spawn(async move {
+            let mut f = framed(b);
+            run_as_responder(&mut f, params).await
+        });
+        let measured = initiator.await.unwrap().unwrap();
+        let remote = responder.await.unwrap().unwrap();
+        let ResponderOutcome::Measured(remote) = remote else {
+            panic!("expected a measurement");
+        };
+        assert_eq!(measured.up_bytes, 2_500);
+        assert_eq!(measured.down_bytes, 2_500);
+        assert_eq!(remote.up_bytes, 2_500);
+        assert_eq!(remote.down_bytes, 2_500);
+    }
+
+    #[tokio::test]
+    async fn responder_rejects_false_byte_count() {
+        let (a, b) = tokio::io::duplex(4096);
+        let params = Params::for_tests();
+        let responder = tokio::spawn(async move {
+            let mut f = framed(b);
+            run_as_responder(&mut f, params).await
+        });
+        let mut initiator = framed(a);
+        initiator
+            .send(Frame::SpeedChunk(Bytes::from_static(&[0; 16])))
+            .await
+            .unwrap();
+        initiator.send(Frame::SpeedDone(15)).await.unwrap();
+        assert!(matches!(
+            responder.await.unwrap().unwrap_err(),
+            Error::ByteCountMismatch {
+                sent: 15,
+                received: 16
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_chunk_is_rejected_before_io() {
+        let (a, _b) = tokio::io::duplex(64);
+        let mut params = Params::for_tests();
+        params.chunk = MAX_FRAME_SIZE;
+        let mut f = framed(a);
+        assert!(matches!(
+            run_as_initiator(&mut f, params).await,
+            Err(Error::InvalidParams(_))
+        ));
     }
 
     #[tokio::test]
