@@ -26,10 +26,27 @@
 //! Handshake: the guest sends `Hello`, the host answers `Hello` followed by
 //! `Config`; afterwards both sides exchange `IpPacket`, `Ping`/`Pong` and
 //! finally `Bye`.
+//!
+//! ## Resynchronisable framing (serial links)
+//!
+//! A TCP connection always starts at a frame boundary, a serial port does
+//! not: either end may start reading in the middle of a frame, and stale
+//! bytes may sit in the UART buffers. On such links every frame is prefixed
+//! with the 4-byte magic [`SYNC_MAGIC`] (`b"NETM"`) and decoded with
+//! [`SyncFrameCodec`], which scans for the magic, discards whatever precedes
+//! it and skips frames whose header or payload is invalid instead of failing
+//! the connection. [`FrameCodec`] (used on TCP) is unchanged.
+//!
+//! ```text
+//! +------+----------------+----------+-------------------------+
+//! | NETM | u32 BE length  | u8 type  | payload (length-1 bytes)|
+//! +------+----------------+----------+-------------------------+
+//! ```
 
 use std::net::Ipv4Addr;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::{Sink, Stream};
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -41,6 +58,10 @@ pub const MAX_FRAME_SIZE: usize = 65536;
 
 /// Size of the length prefix in bytes.
 pub const HEADER_LEN: usize = 4;
+
+/// Magic prefix of every frame on resynchronisable links (see
+/// [`SyncFrameCodec`]). Same bytes as [`crate::discovery::MAGIC`].
+pub const SYNC_MAGIC: &[u8; 4] = b"NETM";
 
 const TYPE_HELLO: u8 = 1;
 const TYPE_CONFIG: u8 = 2;
@@ -265,13 +286,167 @@ impl Encoder<Frame> for FrameCodec {
     }
 }
 
+/// Resynchronising codec for byte streams that may start mid-frame (serial
+/// ports): `SYNC_MAGIC ++ FrameCodec frame`. See the module docs.
+///
+/// Decoding never returns [`FrameError::TooLarge`], [`FrameError::Empty`] or
+/// payload errors: such frames are treated as noise, skipped (counted in
+/// [`discarded`](Self::discarded)) and the scan for the next magic
+/// continues. Only I/O errors from the underlying transport are fatal.
+#[derive(Debug, Default, Clone)]
+pub struct SyncFrameCodec {
+    discarded: u64,
+}
+
+/// Bytes preceding the payload of a sync frame: magic + length prefix.
+const SYNC_PREFIX_LEN: usize = SYNC_MAGIC.len() + HEADER_LEN;
+
+impl SyncFrameCodec {
+    /// Create a codec.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Total number of bytes discarded so far while resynchronising
+    /// (junk before a magic, frames with invalid headers or payloads).
+    pub fn discarded(&self) -> u64 {
+        self.discarded
+    }
+
+    fn skip(&mut self, src: &mut BytesMut, n: usize) {
+        if n > 0 {
+            self.discarded += n as u64;
+            tracing::trace!(
+                bytes = n,
+                total = self.discarded,
+                "sync codec skipping bytes"
+            );
+            src.advance(n);
+        }
+    }
+}
+
+/// Offset of the first `SYNC_MAGIC` in `buf`, if any.
+fn find_magic(buf: &[u8]) -> Option<usize> {
+    buf.windows(SYNC_MAGIC.len())
+        .position(|w| w == SYNC_MAGIC.as_slice())
+}
+
+/// Length of the longest suffix of `buf` that is a proper prefix of
+/// `SYNC_MAGIC` (bytes that may be the start of a magic split across reads).
+fn partial_magic_len(buf: &[u8]) -> usize {
+    (1..SYNC_MAGIC.len())
+        .rev()
+        .find(|&k| buf.len() >= k && buf[buf.len() - k..] == SYNC_MAGIC[..k])
+        .unwrap_or(0)
+}
+
+impl Decoder for SyncFrameCodec {
+    type Item = Frame;
+    type Error = FrameError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, FrameError> {
+        loop {
+            match find_magic(src) {
+                Some(0) => {}
+                Some(off) => self.skip(src, off),
+                None => {
+                    // Keep a possible partial magic at the tail, drop the rest.
+                    let keep = partial_magic_len(src);
+                    let drop = src.len() - keep;
+                    self.skip(src, drop);
+                    src.reserve(SYNC_PREFIX_LEN);
+                    return Ok(None);
+                }
+            }
+            if src.len() < SYNC_PREFIX_LEN {
+                src.reserve(SYNC_PREFIX_LEN - src.len());
+                return Ok(None);
+            }
+            let len = u32::from_be_bytes([src[4], src[5], src[6], src[7]]) as usize;
+            if len == 0 || len > MAX_FRAME_SIZE {
+                // Not a real frame start (magic bytes inside junk or a
+                // corrupted header): step past the first byte and rescan.
+                tracing::debug!(len, "sync codec: implausible length after magic, resyncing");
+                self.skip(src, 1);
+                continue;
+            }
+            // Validate the type byte as soon as it is there, so a fake
+            // header does not make us wait for a body that never comes.
+            if src.len() > SYNC_PREFIX_LEN
+                && !(TYPE_HELLO..=TYPE_BYE).contains(&src[SYNC_PREFIX_LEN])
+            {
+                tracing::debug!(
+                    kind = src[SYNC_PREFIX_LEN],
+                    "sync codec: unknown type after magic, resyncing"
+                );
+                self.skip(src, 1);
+                continue;
+            }
+            let total = SYNC_PREFIX_LEN + len;
+            if src.len() < total {
+                src.reserve(total - src.len());
+                return Ok(None);
+            }
+            let mut body = src.split_to(total);
+            body.advance(SYNC_PREFIX_LEN);
+            let kind = body.get_u8();
+            match FrameCodec::decode_payload(kind, body.freeze()) {
+                Ok(f) => return Ok(Some(f)),
+                Err(e) => {
+                    // A well-delimited but invalid frame: drop it and go on.
+                    self.discarded += total as u64;
+                    tracing::warn!(error = %e, "sync codec: dropping invalid frame");
+                }
+            }
+        }
+    }
+}
+
+impl Encoder<Frame> for SyncFrameCodec {
+    type Error = FrameError;
+
+    fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), FrameError> {
+        dst.reserve(SYNC_PREFIX_LEN);
+        dst.extend_from_slice(SYNC_MAGIC);
+        let magic_at = dst.len() - SYNC_MAGIC.len();
+        if let Err(e) = FrameCodec.encode(item, dst) {
+            dst.truncate(magic_at);
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
 /// A transport wrapped with [`FrameCodec`]: a `Stream<Item = Result<Frame,
 /// FrameError>>` + `Sink<Frame>`.
 pub type FramedTransport<T> = Framed<T, FrameCodec>;
 
+/// A transport wrapped with [`SyncFrameCodec`].
+pub type SyncFramedTransport<T> = Framed<T, SyncFrameCodec>;
+
 /// Wrap a transport with the frame codec.
 pub fn framed<T: Transport>(t: T) -> FramedTransport<T> {
     Framed::new(t, FrameCodec)
+}
+
+/// Wrap a transport with the resynchronising codec (serial links).
+pub fn framed_sync<T: Transport>(t: T) -> SyncFramedTransport<T> {
+    Framed::new(t, SyncFrameCodec::new())
+}
+
+/// Anything that speaks frames: a `Stream` of decoded frames plus a `Sink`
+/// for outgoing ones. Implemented by [`FramedTransport`] and
+/// [`SyncFramedTransport`]; `Box<dyn FrameIo>` lets host and guest run one
+/// session implementation over either codec.
+pub trait FrameIo:
+    Stream<Item = Result<Frame, FrameError>> + Sink<Frame, Error = FrameError> + Send + Unpin
+{
+}
+
+impl<T> FrameIo for T where
+    T: Stream<Item = Result<Frame, FrameError>> + Sink<Frame, Error = FrameError> + Send + Unpin
+{
 }
 
 #[cfg(test)]
@@ -460,5 +635,162 @@ mod tests {
         let ((), got) = tokio::join!(send, recv);
         assert_eq!(&got[..frames.len()], &frames[..]);
         assert_eq!(got.last(), Some(&Frame::Bye));
+    }
+
+    // -----------------------------------------------------------------------
+    // SyncFrameCodec
+    // -----------------------------------------------------------------------
+
+    fn encode_all_sync(frames: &[Frame]) -> BytesMut {
+        let mut codec = SyncFrameCodec::new();
+        let mut buf = BytesMut::new();
+        for f in frames {
+            codec.encode(f.clone(), &mut buf).unwrap();
+        }
+        buf
+    }
+
+    fn decode_all_sync(codec: &mut SyncFrameCodec, buf: &mut BytesMut) -> Vec<Frame> {
+        let mut out = Vec::new();
+        while let Some(f) = codec.decode(buf).unwrap() {
+            out.push(f);
+        }
+        out
+    }
+
+    #[test]
+    fn sync_layout_is_magic_plus_plain_frame() {
+        let mut buf = BytesMut::new();
+        SyncFrameCodec::new().encode(Frame::Bye, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"NETM\x00\x00\x00\x01\x06");
+        assert_eq!(SYNC_MAGIC, crate::discovery::MAGIC);
+    }
+
+    #[test]
+    fn sync_round_trip_every_variant() {
+        let frames = sample_frames();
+        let mut buf = encode_all_sync(&frames);
+        let mut codec = SyncFrameCodec::new();
+        assert_eq!(decode_all_sync(&mut codec, &mut buf), frames);
+        assert!(buf.is_empty());
+        assert_eq!(codec.discarded(), 0);
+    }
+
+    #[test]
+    fn sync_skips_junk_and_partial_frame_before_first_magic() {
+        let frames = sample_frames();
+        let wire = encode_all_sync(&frames);
+        // Start mid-way through the first frame (as if the reader attached
+        // late), preceded by unrelated junk that even contains "NET".
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(b"garbage NET garbage\x00\xff");
+        let cut = 7; // inside the first frame's header
+        buf.extend_from_slice(&wire[cut..]);
+        let mut codec = SyncFrameCodec::new();
+        let got = decode_all_sync(&mut codec, &mut buf);
+        assert_eq!(
+            got,
+            frames[1..].to_vec(),
+            "first (partial) frame is lost, rest recovered"
+        );
+        assert!(buf.is_empty());
+        assert!(codec.discarded() > 0);
+    }
+
+    #[test]
+    fn sync_partial_reads_byte_by_byte_with_leading_junk() {
+        let frames = sample_frames();
+        let mut wire = BytesMut::from(&b"\x01\x02NE\x03NETX"[..]);
+        wire.extend_from_slice(&encode_all_sync(&frames));
+        let mut codec = SyncFrameCodec::new();
+        let mut buf = BytesMut::new();
+        let mut out = Vec::new();
+        for b in wire.iter() {
+            buf.put_u8(*b);
+            if let Some(f) = codec.decode(&mut buf).unwrap() {
+                out.push(f);
+            }
+        }
+        assert_eq!(out, frames);
+        // Junk never accumulates: at most a partial magic is retained.
+        assert!(buf.len() < SYNC_MAGIC.len());
+    }
+
+    #[test]
+    fn sync_magic_inside_junk_with_bogus_length_resyncs() {
+        let frames = sample_frames();
+        let mut buf = BytesMut::new();
+        // Magic followed by an oversized length, then a zero length.
+        buf.extend_from_slice(b"NETM\xff\xff\xff\xff");
+        buf.extend_from_slice(b"NETM\x00\x00\x00\x00");
+        // Magic followed by a plausible (large) length but an unknown type
+        // byte: must not wait for the body.
+        buf.extend_from_slice(b"NETM\x00\x00\x40\x00\xaa");
+        // Magic, valid length and type, but a Ping payload of 2 bytes.
+        buf.extend_from_slice(b"NETM\x00\x00\x00\x03\x04\x00\x00");
+        buf.extend_from_slice(&encode_all_sync(&frames));
+        let mut codec = SyncFrameCodec::new();
+        assert_eq!(decode_all_sync(&mut codec, &mut buf), frames);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn sync_payload_containing_magic_is_not_split() {
+        // An IP packet whose payload contains the magic and a fake header.
+        let mut pkt = vec![0x45u8; 20];
+        pkt.extend_from_slice(b"NETM\x00\x00\x00\x01\x06");
+        pkt.extend_from_slice(b"NETM\x00\x00\x00\x09\x04");
+        let frames = vec![
+            Frame::IpPacket(Bytes::from(pkt)),
+            Frame::Ping(7),
+            Frame::Bye,
+        ];
+        let mut buf = encode_all_sync(&frames);
+        let mut codec = SyncFrameCodec::new();
+        assert_eq!(decode_all_sync(&mut codec, &mut buf), frames);
+        assert_eq!(codec.discarded(), 0);
+    }
+
+    #[test]
+    fn sync_encoder_rejects_oversized_and_leaves_buffer_clean() {
+        let too_big = Bytes::from(vec![0u8; MAX_FRAME_SIZE]);
+        let mut buf = BytesMut::new();
+        let err = SyncFrameCodec::new()
+            .encode(Frame::IpPacket(too_big), &mut buf)
+            .unwrap_err();
+        assert!(matches!(err, FrameError::TooLarge(_)));
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_framed_over_duplex_with_late_reader() {
+        use futures::{SinkExt, StreamExt};
+        use tokio::io::AsyncWriteExt;
+        let (mut a, b) = tokio::io::duplex(64 * 1024);
+        // Raw junk first (the "other end was already running" case),
+        // ending in a partial magic.
+        a.write_all(b"\x00\x11\x22NET").await.unwrap();
+        let mut fa = framed_sync(a);
+        let mut fb = framed_sync(b);
+        let frames = sample_frames();
+        for f in &frames {
+            fa.send(f.clone()).await.unwrap();
+        }
+        let mut got = Vec::new();
+        while got.len() < frames.len() {
+            got.push(fb.next().await.unwrap().unwrap());
+        }
+        assert_eq!(got, frames);
+    }
+
+    #[test]
+    fn frame_io_is_object_safe() {
+        fn takes(_: &dyn FrameIo) {}
+        let (a, _b) = tokio::io::duplex(16);
+        let plain = framed(a);
+        takes(&plain);
+        let (c, _d) = tokio::io::duplex(16);
+        let boxed: Box<dyn FrameIo> = Box::new(framed_sync(c));
+        takes(boxed.as_ref());
     }
 }

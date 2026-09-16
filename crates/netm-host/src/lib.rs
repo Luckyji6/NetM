@@ -1,9 +1,10 @@
 //! # netm-host
 //!
-//! Host side of the NetM tunnel: accepts a guest session over TCP, answers
-//! link-local discovery probes, and terminates the guest's IP packets in a
-//! user-space TCP/IP stack ([`ipstack`]) whose flows are forwarded through
-//! ordinary sockets. No elevated privileges are required.
+//! Host side of the NetM tunnel: accepts a guest session over TCP (or a USB
+//! serial port, see [`HostConfig::serial`]), answers link-local discovery
+//! probes, and terminates the guest's IP packets in a user-space TCP/IP
+//! stack ([`ipstack`]) whose flows are forwarded through ordinary sockets.
+//! No elevated privileges are required.
 //!
 //! The crate exposes a single entry point, [`run`], driven by an event channel
 //! (for a TUI or a headless logger) and a command watch channel:
@@ -31,7 +32,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -40,6 +41,8 @@ use netm_proto::{Counters, LinkInterface, RateMeter, TunnelConfig, DATA_PORT};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+pub use netm_proto::Endpoint;
 
 pub mod device;
 pub mod dns;
@@ -50,6 +53,31 @@ pub(crate) mod session;
 pub const STATS_INTERVAL: Duration = Duration::from_millis(500);
 /// Interval at which candidate interfaces are re-enumerated.
 pub const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// Pause between attempts to open an unavailable serial port.
+pub const SERIAL_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Where a guest is connected from: a TCP peer or a serial port. Alias of
+/// [`netm_proto::Endpoint`].
+pub type Peer = Endpoint;
+
+/// Serial port the host serves a guest on, in addition to TCP.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerialSettings {
+    /// Device path (`/dev/tty.usbmodem1234`, `/dev/ttyACM0`, `COM5`).
+    pub path: String,
+    /// Line speed; default [`netm_proto::transport::serial::DEFAULT_BAUD`].
+    pub baud: u32,
+}
+
+impl SerialSettings {
+    /// `path` at the default baud rate.
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            baud: netm_proto::transport::serial::DEFAULT_BAUD,
+        }
+    }
+}
 
 /// Host configuration.
 #[derive(Clone, Debug)]
@@ -71,6 +99,13 @@ pub struct HostConfig {
     /// Upstream DNS resolvers. `None` = read the system resolvers and refresh
     /// them every 30 s.
     pub dns_upstreams: Option<Vec<SocketAddr>>,
+    /// Also serve a guest over this serial port (USB CDC-ACM fallback for
+    /// cables that do not form a network link). The port is (re)opened
+    /// every [`SERIAL_RETRY_INTERVAL`] until it exists, the host then waits
+    /// for the guest's `Hello`; after a session ends the port is closed and
+    /// reopened. TCP listening continues in parallel; only one guest is
+    /// served at a time across both transports.
+    pub serial: Option<SerialSettings>,
 }
 
 impl Default for HostConfig {
@@ -81,6 +116,7 @@ impl Default for HostConfig {
             tunnel: TunnelConfig::default(),
             host_name: default_host_name(),
             dns_upstreams: None,
+            serial: None,
         }
     }
 }
@@ -140,7 +176,8 @@ pub struct FlowInfo {
 /// A connected guest.
 #[derive(Clone, Debug)]
 pub struct GuestInfo {
-    pub peer: SocketAddr,
+    /// TCP address or serial port the guest is connected through.
+    pub peer: Peer,
     pub name: String,
     pub connected_at: Instant,
     pub assigned_ip: Ipv4Addr,
@@ -156,9 +193,15 @@ pub enum HostEvent {
     /// Candidate link interfaces; emitted on start and whenever the list
     /// changes.
     Interfaces(Vec<LinkInterface>),
+    /// The configured serial port was opened (`open = true`, now waiting for
+    /// a guest) or closed (`open = false`, will be reopened).
+    SerialState {
+        path: String,
+        open: bool,
+    },
     GuestConnected(GuestInfo),
     GuestDisconnected {
-        peer: SocketAddr,
+        peer: Peer,
         reason: String,
     },
     FlowOpened(FlowInfo),
@@ -231,6 +274,35 @@ pub(crate) struct Shared {
     pub dns: dns::Upstreams,
     pub active_flows: Arc<AtomicUsize>,
     pub next_flow_id: AtomicU64,
+    /// The one guest currently served (TCP or serial).
+    pub active_guest: Mutex<Option<Peer>>,
+}
+
+impl Shared {
+    /// Take the single guest slot for `peer`; `false` if it is taken.
+    pub(crate) fn claim_guest(&self, peer: &Peer) -> bool {
+        let mut slot = self.active_guest.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(peer.clone());
+        true
+    }
+
+    /// Free the slot if `peer` holds it.
+    pub(crate) fn release_guest(&self, peer: &Peer) {
+        let mut slot = self.active_guest.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref() == Some(peer) {
+            *slot = None;
+        }
+    }
+
+    pub(crate) fn active_guest(&self) -> Option<Peer> {
+        self.active_guest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 /// Run the host until `ctrl` turns to [`HostCommand::Shutdown`] (or its
@@ -288,10 +360,20 @@ pub async fn run(
         dns: dns_upstreams.clone(),
         active_flows: Arc::new(AtomicUsize::new(0)),
         next_flow_id: AtomicU64::new(1),
+        active_guest: Mutex::new(None),
     });
 
     let root_cancel = CancellationToken::new();
     let mut background: Vec<JoinHandle<()>> = Vec::new();
+
+    // Serial port session loop (optional, runs alongside TCP).
+    let mut serial_task: Option<JoinHandle<()>> = cfg.serial.clone().map(|settings| {
+        tokio::spawn(serial_loop(
+            settings,
+            Arc::clone(&shared),
+            root_cancel.child_token(),
+        ))
+    });
 
     // Stats ticker.
     background.push(tokio::spawn(stats_task(
@@ -313,7 +395,7 @@ pub async fn run(
         root_cancel.child_token(),
     )));
 
-    let mut current: Option<(SocketAddr, JoinHandle<()>)> = None;
+    let mut current: Option<(Peer, JoinHandle<()>)> = None;
     let result = loop {
         tokio::select! {
             changed = ctrl.changed() => {
@@ -326,9 +408,16 @@ pub async fn run(
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
                     let _ = stream.set_nodelay(true);
-                    let busy = matches!(&current, Some((_, h)) if !h.is_finished());
-                    if busy {
-                        let active = current.as_ref().map(|(p, _)| *p).unwrap_or(peer);
+                    let peer = Peer::Tcp(peer);
+                    // Busy if a TCP session task is still alive (it may be in
+                    // its handshake) or any guest (TCP or serial) holds the slot.
+                    let tcp_busy = matches!(&current, Some((_, h)) if !h.is_finished());
+                    let active = if tcp_busy {
+                        current.as_ref().map(|(p, _)| p.clone())
+                    } else {
+                        shared.active_guest()
+                    };
+                    if let Some(active) = active {
                         emitter
                             .log(format!("rejecting guest {peer}: {active} is already connected"))
                             .await;
@@ -336,8 +425,8 @@ pub async fn run(
                         continue;
                     }
                     let handle = tokio::spawn(session::run_session(
-                        stream,
-                        peer,
+                        netm_proto::framed(stream),
+                        peer.clone(),
                         Arc::clone(&shared),
                         root_cancel.child_token(),
                     ));
@@ -355,7 +444,14 @@ pub async fn run(
 
     // Orderly teardown: sessions send Bye and stop, then background tasks go.
     root_cancel.cancel();
-    if let Some((_, mut handle)) = current.take() {
+    let mut sessions: Vec<JoinHandle<()>> = Vec::new();
+    if let Some((_, handle)) = current.take() {
+        sessions.push(handle);
+    }
+    if let Some(handle) = serial_task.take() {
+        sessions.push(handle);
+    }
+    for mut handle in sessions {
         if tokio::time::timeout(Duration::from_secs(3), &mut handle)
             .await
             .is_err()
@@ -368,6 +464,98 @@ pub async fn run(
     }
     drop(listener);
     result
+}
+
+/// Serve guests on a serial port until `cancel` fires: open the port
+/// (retrying while it is absent), wait for a `Hello`, run the session, then
+/// close and reopen the port for the next guest.
+async fn serial_loop(settings: SerialSettings, shared: Arc<Shared>, cancel: CancellationToken) {
+    use futures::SinkExt as _;
+    let peer = Peer::Serial(settings.path.clone());
+    let mut last_open_error: Option<String> = None;
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let port = match netm_proto::transport::serial::open(&settings.path, settings.baud).await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = e.to_string();
+                if last_open_error.as_deref() != Some(msg.as_str()) {
+                    shared
+                        .events
+                        .log(format!(
+                            "serial port {} unavailable ({msg}); retrying every {}s",
+                            settings.path,
+                            SERIAL_RETRY_INTERVAL.as_secs()
+                        ))
+                        .await;
+                    last_open_error = Some(msg);
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(SERIAL_RETRY_INTERVAL) => continue,
+                }
+            }
+        };
+        last_open_error = None;
+        shared
+            .events
+            .log(format!(
+                "serial port {} opened ({} baud), waiting for a guest",
+                settings.path, settings.baud
+            ))
+            .await;
+        shared
+            .events
+            .send(HostEvent::SerialState {
+                path: settings.path.clone(),
+                open: true,
+            })
+            .await;
+
+        let mut framed = netm_proto::framed_sync(port);
+        let end = match session::wait_for_hello(&mut framed, &shared, &cancel).await {
+            Ok(None) => "host shutting down".to_string(),
+            Ok(Some(name)) => session::serve_connected(
+                framed,
+                peer.clone(),
+                name,
+                Arc::clone(&shared),
+                cancel.child_token(),
+            )
+            .await
+            .unwrap_or_else(|| "another guest is already connected".to_string()),
+            Err(e) => {
+                let _ = framed.close().await;
+                e
+            }
+        };
+        shared
+            .events
+            .send(HostEvent::SerialState {
+                path: settings.path.clone(),
+                open: false,
+            })
+            .await;
+        if cancel.is_cancelled() {
+            shared
+                .events
+                .log(format!("serial port {} closed", settings.path))
+                .await;
+            return;
+        }
+        shared
+            .events
+            .log(format!("serial port {} closed ({end}); reopening", settings.path))
+            .await;
+        // Let the device settle (and avoid a hot loop on a flapping port).
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
+    }
 }
 
 async fn stats_task(shared: Arc<Shared>, cancel: CancellationToken) {

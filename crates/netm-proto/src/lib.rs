@@ -6,7 +6,8 @@
 //!
 //! Modules:
 //! - [`frame`]: length-prefixed frame protocol ([`frame::Frame`], [`frame::FrameCodec`]).
-//! - [`transport`]: the [`transport::Transport`] trait plus a TCP implementation.
+//! - [`transport`]: the [`transport::Transport`] trait, [`transport::Endpoint`],
+//!   TCP helpers and the USB serial fallback ([`transport::serial`]).
 //! - [`discovery`]: IPv6 link-local multicast discovery (`ff02::1`).
 //! - [`link`]: enumeration of Thunderbolt / USB Ethernet interfaces.
 //! - [`privilege`]: privilege checks.
@@ -32,7 +33,10 @@ pub const DATA_PORT: u16 = 27778;
 /// Default MTU of the virtual tunnel interface.
 pub const DEFAULT_MTU: u16 = 1400;
 
-pub use frame::{framed, Frame, FrameCodec, FrameError, FramedTransport, TunnelConfig};
+pub use frame::{
+    framed, framed_sync, Frame, FrameCodec, FrameError, FrameIo, FramedTransport, SyncFrameCodec,
+    SyncFramedTransport, TunnelConfig,
+};
 pub use link::{list_candidate_interfaces, LinkInterface, LinkKind};
 pub use stats::{Counters, RateMeter};
-pub use transport::Transport;
+pub use transport::{Endpoint, Transport};
