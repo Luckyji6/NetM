@@ -1,0 +1,16 @@
+[package]
+name = "netm-cli"
+description = "NetM command line / TUI entry point"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "netm"
+path = "src/main.rs"
+
+[dependencies]
+netm-proto = { workspace = true }
+netm-host = { workspace = true }
+netm-guest = { workspace = true }

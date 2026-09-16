@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+repository = ""
+authors = ["Luckyji6 <lucky123456jx@qq.com>"]
+
+[workspace.dependencies]
+# Internal crates
+netm-proto = { path = "crates/netm-proto" }
+netm-host = { path = "crates/netm-host" }
+netm-guest = { path = "crates/netm-guest" }
+
+# Async runtime & I/O
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.12"
+futures = "0.3"
+thiserror = "2.0"
+tracing = "0.1"
+
+# Serialization (control payloads use postcard)
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", features = ["use-std"] }
+
+# Networking
+socket2 = { version = "0.6", features = ["all"] }
+nix = { version = "0.31", features = ["net", "user"] }
+if-addrs = "0.15"

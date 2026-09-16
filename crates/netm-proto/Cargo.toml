@@ -1,0 +1,26 @@
+[package]
+name = "netm-proto"
+description = "NetM wire protocol: frame codec, transport trait, link-local discovery, interface enumeration, stats"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+socket2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+if-addrs = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
