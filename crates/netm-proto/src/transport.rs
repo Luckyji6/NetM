@@ -22,6 +22,11 @@ pub mod tcp {
     use socket2::{Domain, Protocol, Socket, Type};
     use tokio::net::{TcpListener, TcpStream};
 
+    /// Tune a connected stream for a high-throughput, low-latency tunnel.
+    pub fn tune(stream: &TcpStream) -> io::Result<()> {
+        stream.set_nodelay(true)
+    }
+
     /// Bind a TCP listener on `addr` with `SO_REUSEADDR` set.
     ///
     /// For IPv6 addresses `IPV6_V6ONLY` is cleared so an `[::]` listener also
@@ -59,7 +64,7 @@ pub mod tcp {
         let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp connect timed out"))??;
-        stream.set_nodelay(true)?;
+        tune(&stream)?;
         Ok(stream)
     }
 

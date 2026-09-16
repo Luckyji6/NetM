@@ -9,6 +9,13 @@ license = "MIT"
 repository = ""
 authors = ["Luckyji6 <lucky123456jx@qq.com>"]
 
+[profile.release]
+# The packet path crosses all four workspace crates. Cross-crate inlining is
+# worth the slightly longer release build for a long-running tunnel binary.
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
 [workspace.dependencies]
 # Internal crates
 netm-proto = { path = "crates/netm-proto" }

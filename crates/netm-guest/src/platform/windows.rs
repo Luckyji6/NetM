@@ -519,7 +519,7 @@ Configuration for interface \"NetM\"
             vec![
                 "netsh interface ipv4 show interfaces",
                 "netsh interface ipv4 show addresses name=NetM",
-                "netsh interface ipv4 set subinterface interface=NetM mtu=1400 store=active",
+                "netsh interface ipv4 set subinterface interface=NetM mtu=9000 store=active",
                 "netsh interface ipv4 set interface interface=NetM metric=1 store=active",
                 "route add 0.0.0.0 mask 128.0.0.0 10.77.0.1 metric 5 if 34",
                 "route add 128.0.0.0 mask 128.0.0.0 10.77.0.1 metric 5 if 34",

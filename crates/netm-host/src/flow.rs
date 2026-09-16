@@ -41,7 +41,7 @@ pub const DNS_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often an idle stack-side TCP read is re-polled (see [`pump_tcp`]).
 const STACK_READ_NUDGE: Duration = Duration::from_millis(500);
 
-const COPY_BUF: usize = 32 * 1024;
+const COPY_BUF: usize = 256 * 1024;
 const MAX_DATAGRAM: usize = 65535;
 
 /// Live byte counters of one flow (`tx` = guest → internet).
@@ -173,7 +173,7 @@ async fn tcp_flow(
             let s = tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(target))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-            let _ = s.set_nodelay(true);
+            let _ = netm_proto::transport::tcp::tune(&s);
             Ok(s)
         }
     };

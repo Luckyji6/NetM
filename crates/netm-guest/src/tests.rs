@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
 use crate::env::GuestEnv;
-use crate::guest::{Guest, Timings};
+use crate::guest::{next_retry_backoff, Guest, Timings};
 use crate::platform::PlatformConfigurator;
 use crate::tun::fake::{FakeTun, FakeTunHandle};
 use crate::{GuestCommand, GuestConfig, GuestEvent, GuestState, HostTarget, RouteMode};
@@ -232,6 +232,7 @@ fn spawn_fake_host(stream: DuplexStream, config: TunnelConfig) -> FakeHost {
 fn fast_timings() -> Timings {
     Timings {
         retry_backoff: Duration::from_millis(50),
+        max_retry_backoff: Duration::from_millis(200),
         probe_timeout: Duration::from_millis(100),
         connect_timeout: Duration::from_millis(500),
         handshake_timeout: Duration::from_secs(2),
@@ -243,6 +244,18 @@ fn fast_timings() -> Timings {
         send_timeout: Duration::from_secs(1),
         speed: netm_proto::speed::Params::for_tests(),
     }
+}
+
+#[test]
+fn reconnect_backoff_doubles_and_caps() {
+    let max = Duration::from_secs(30);
+    let mut delay = Duration::from_secs(1);
+    let mut seen = vec![delay];
+    for _ in 0..6 {
+        delay = next_retry_backoff(delay, max);
+        seen.push(delay);
+    }
+    assert_eq!(seen, [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs));
 }
 
 struct Harness {

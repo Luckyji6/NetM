@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use netm_proto::{
     framed, Frame, FramedTransport, LinkInterface, RateMeter, Transport, TunnelConfig,
 };
@@ -19,11 +19,23 @@ use crate::platform::PlatformConfigurator;
 use crate::tun::TunIo;
 use crate::{GuestCommand, GuestConfig, GuestEvent, GuestState, HostTarget};
 
+/// Maximum number of already-queued TUN packets coalesced into one TCP
+/// flush. The drain never waits for another packet, preserving low-load
+/// latency while reducing syscalls under sustained traffic.
+const MAX_PACKET_BATCH: usize = 64;
+/// At 1 Gbit/s, 64 KiB represents about 0.52 ms on the wire. Capping a
+/// batch by bytes prevents bulk traffic from creating multi-millisecond
+/// application-side queues behind jumbo packets.
+const MAX_PACKET_BATCH_BYTES: usize = 64 * 1024;
+
 /// Tunables of the state machine (shrunk in tests).
 #[derive(Clone, Debug)]
 pub(crate) struct Timings {
     /// Pause between link/discovery rounds and before a reconnect attempt.
     pub retry_backoff: Duration,
+    /// Maximum reconnect delay after repeated connection failures. The
+    /// delay doubles up to this value and resets after a real session.
+    pub max_retry_backoff: Duration,
     /// Discovery probe timeout per interface.
     pub probe_timeout: Duration,
     /// TCP connect timeout.
@@ -53,6 +65,7 @@ impl Default for Timings {
     fn default() -> Self {
         Self {
             retry_backoff: Duration::from_secs(1),
+            max_retry_backoff: Duration::from_secs(30),
             probe_timeout: Duration::from_secs(2),
             connect_timeout: Duration::from_secs(3),
             handshake_timeout: Duration::from_secs(5),
@@ -135,6 +148,10 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+pub(crate) fn next_retry_backoff(current: Duration, maximum: Duration) -> Duration {
+    current.saturating_mul(2).min(maximum)
+}
+
 /// Interface name for the scope id of a link-local manual target, if any.
 fn iface_for_addr(addr: &SocketAddr, ifaces: &[LinkInterface]) -> Option<String> {
     match addr {
@@ -152,6 +169,18 @@ async fn send_frame<T: Transport>(
     timeout: Duration,
 ) -> Result<(), String> {
     match tokio::time::timeout(timeout, framed.send(frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("send failed: {e}")),
+        Err(_) => Err("send timed out".to_string()),
+    }
+}
+
+async fn feed_frame<T: Transport>(
+    framed: &mut FramedTransport<T>,
+    frame: Frame,
+    timeout: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(timeout, framed.feed(frame)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("send failed: {e}")),
         Err(_) => Err("send timed out".to_string()),
@@ -331,6 +360,7 @@ impl<E: GuestEnv> Guest<E> {
     /// disconnect when `reconnect` is off).
     pub(crate) async fn run(mut self) -> Result<()> {
         self.report_local_egress().await;
+        let mut failure_backoff = self.timings.retry_backoff;
         loop {
             if self.shutdown_requested() {
                 break;
@@ -340,7 +370,7 @@ impl<E: GuestEnv> Guest<E> {
                 Ok(None) => continue,
                 Err(Shutdown) => break,
             };
-            match self.serve(target).await {
+            let retry_delay = match self.serve(target).await {
                 Outcome::Shutdown => break,
                 Outcome::Lost(reason) => {
                     self.set_state(GuestState::Disconnected {
@@ -354,6 +384,8 @@ impl<E: GuestEnv> Guest<E> {
                     }
                     self.log(format!("disconnected ({reason}); reconnecting"))
                         .await;
+                    failure_backoff = self.timings.retry_backoff;
+                    self.timings.retry_backoff
                 }
                 Outcome::Failed(err) => {
                     let reason = format!("{err:#}");
@@ -365,10 +397,18 @@ impl<E: GuestEnv> Guest<E> {
                     if !self.cfg.reconnect {
                         return Err(err);
                     }
+                    let delay = failure_backoff;
+                    failure_backoff =
+                        next_retry_backoff(failure_backoff, self.timings.max_retry_backoff);
+                    self.log(format!(
+                        "host unavailable; retrying in {:.1}s",
+                        delay.as_secs_f64()
+                    ))
+                    .await;
+                    delay
                 }
-            }
-            self.set_state(GuestState::WaitingForLink).await;
-            if self.sleep(self.timings.retry_backoff).await.is_err() {
+            };
+            if self.sleep(retry_delay).await.is_err() {
                 break;
             }
         }
@@ -673,12 +713,32 @@ impl<E: GuestEnv> Guest<E> {
                 res = tun.recv(&mut buf) => {
                     match res {
                         Ok(0) => {}
-                        Ok(n) => {
-                            let pkt = Bytes::copy_from_slice(&buf[..n]);
-                            if let Err(e) = send_frame(framed, Frame::IpPacket(pkt), t.send_timeout).await {
-                                return SessionEnd::Lost(e);
+                        Ok(first_len) => {
+                            let mut next_len = Some(first_len);
+                            let mut budget = MAX_PACKET_BATCH;
+                            let mut batch_bytes = 0usize;
+                            while let Some(n) = next_len.take() {
+                                let pkt = Bytes::copy_from_slice(&buf[..n]);
+                                if let Err(e) = feed_frame(framed, Frame::IpPacket(pkt), t.send_timeout).await {
+                                    return SessionEnd::Lost(e);
+                                }
+                                meter.record_tx(n);
+                                batch_bytes += n;
+                                budget -= 1;
+                                if budget == 0 || batch_bytes >= MAX_PACKET_BATCH_BYTES {
+                                    break;
+                                }
+                                next_len = match tun.recv(&mut buf).now_or_never() {
+                                    Some(Ok(0)) | None => None,
+                                    Some(Ok(n)) => Some(n),
+                                    Some(Err(e)) => return SessionEnd::Lost(format!("tun read error: {e}")),
+                                };
                             }
-                            meter.record_tx(n);
+                            match tokio::time::timeout(t.send_timeout, framed.flush()).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => return SessionEnd::Lost(format!("send failed: {e}")),
+                                Err(_) => return SessionEnd::Lost("send timed out".into()),
+                            }
                         }
                         Err(e) => {
                             return SessionEnd::Lost(format!("tun read error: {e}"));

@@ -45,6 +45,11 @@ pub const MAX_FRAME_SIZE: usize = 65536;
 /// Size of the length prefix in bytes.
 pub const HEADER_LEN: usize = 4;
 
+/// Amount of encoded data a framed transport may coalesce before applying
+/// sink backpressure. The tokio-util default is 8 KiB, which forces a flush
+/// after only a handful of tunnel packets and limits high-speed links.
+pub const WRITE_BUFFER_BOUNDARY: usize = 128 * 1024;
+
 const TYPE_HELLO: u8 = 1;
 const TYPE_CONFIG: u8 = 2;
 const TYPE_IP_PACKET: u8 = 3;
@@ -320,7 +325,9 @@ pub type FramedTransport<T> = Framed<T, FrameCodec>;
 
 /// Wrap a transport with the frame codec.
 pub fn framed<T: Transport>(t: T) -> FramedTransport<T> {
-    Framed::new(t, FrameCodec)
+    let mut framed = Framed::new(t, FrameCodec);
+    framed.set_backpressure_boundary(WRITE_BUFFER_BOUNDARY);
+    framed
 }
 
 #[cfg(test)]
@@ -515,5 +522,11 @@ mod tests {
         let ((), got) = tokio::join!(send, recv);
         assert_eq!(&got[..frames.len()], &frames[..]);
         assert_eq!(got.last(), Some(&Frame::Bye));
+    }
+
+    #[test]
+    fn framed_uses_tunnel_write_boundary() {
+        let (a, _b) = tokio::io::duplex(16);
+        assert_eq!(framed(a).backpressure_boundary(), WRITE_BUFFER_BOUNDARY);
     }
 }

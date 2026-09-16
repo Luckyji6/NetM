@@ -35,8 +35,15 @@ const TCP_SESSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Stack-side UDP timeout; kept above the forwarder's own idle timeouts so
 /// that those govern.
 const STACK_UDP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Per-flow TCP buffering inside ipstack. Its 16 KiB defaults throttle a
+/// low-latency 1 Gbit/s link before either the cable or NIC is saturated.
+const TCP_MAX_UNACKED: u32 = u16::MAX as u32;
+const TCP_READ_BUFFER: usize = 1024 * 1024;
 /// Packets queued in each direction between the frame pump and the stack.
 const PACKET_QUEUE: usize = 1024;
+/// Bound a single writer batch to roughly 0.52 ms at 1 Gbit/s, balancing
+/// syscall amortisation with latency-sensitive traffic.
+const WRITE_BATCH_BYTES: usize = 64 * 1024;
 
 /// Outcome of validating the guest's first frame.
 #[derive(Debug, PartialEq, Eq)]
@@ -271,6 +278,8 @@ fn stack_config(shared: &Shared) -> IpStackConfig {
     cfg.udp_timeout(STACK_UDP_TIMEOUT);
     let mut tcp = TcpConfig::default();
     tcp.timeout = TCP_SESSION_TIMEOUT;
+    tcp.max_unacked_bytes = TCP_MAX_UNACKED;
+    tcp.read_buffer_size = TCP_READ_BUFFER;
     cfg.with_tcp_config(tcp);
     cfg
 }
@@ -472,15 +481,21 @@ async fn writer_loop<T: Transport>(
         let first = tokio::select! {
             biased;
             c = ctrl.recv(), if ctrl_open => match c {
-                Some(f) => Some(f),
+                Some(f) => Some((f, 0)),
                 None => { ctrl_open = false; None }
             },
             p = packets.recv(), if packets_open => match p {
-                Some(b) => { meter.record_tx(b.len()); Some(Frame::IpPacket(b)) }
+                Some(b) => {
+                    let len = b.len();
+                    meter.record_tx(len);
+                    Some((Frame::IpPacket(b), len))
+                }
                 None => { packets_open = false; None }
             },
         };
-        let Some(first) = first else { continue };
+        let Some((first, mut batch_bytes)) = first else {
+            continue;
+        };
         sink.feed(first).await?;
         // Drain whatever else is ready so one flush covers a burst.
         let mut budget = 64;
@@ -490,9 +505,14 @@ async fn writer_loop<T: Transport>(
                 sink.feed(f).await?;
                 continue;
             }
+            if batch_bytes >= WRITE_BATCH_BYTES {
+                break;
+            }
             match packets.try_recv() {
                 Ok(b) => {
-                    meter.record_tx(b.len());
+                    let len = b.len();
+                    meter.record_tx(len);
+                    batch_bytes += len;
                     sink.feed(Frame::IpPacket(b)).await?;
                 }
                 Err(_) => break,
@@ -543,6 +563,15 @@ mod tests {
             HelloCheck::Reject(r) if r.contains("Ping")
         ));
         assert!(matches!(check_hello(None), HelloCheck::Reject(_)));
+    }
+
+    #[test]
+    fn stack_is_tuned_for_jumbo_high_throughput_tunnel() {
+        let (shared, _rx) = shared();
+        let cfg = stack_config(&shared);
+        assert_eq!(cfg.mtu, netm_proto::DEFAULT_MTU);
+        assert_eq!(cfg.tcp_config.max_unacked_bytes, TCP_MAX_UNACKED);
+        assert_eq!(cfg.tcp_config.read_buffer_size, TCP_READ_BUFFER);
     }
 
     #[tokio::test]

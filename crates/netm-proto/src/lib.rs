@@ -35,7 +35,12 @@ pub const DISCOVERY_PORT: u16 = 27777;
 pub const DATA_PORT: u16 = 27778;
 
 /// Default MTU of the virtual tunnel interface.
-pub const DEFAULT_MTU: u16 = 1400;
+///
+/// The tunnel terminates TCP in user space on the host, so inner packets do
+/// not have to fit the Internet-facing Ethernet MTU. A jumbo virtual MTU
+/// substantially reduces framing, channel and syscall overhead while the
+/// host's real sockets still use the egress interface's actual MTU.
+pub const DEFAULT_MTU: u16 = 9000;
 
 pub use frame::{framed, Frame, FrameCodec, FrameError, FramedTransport, TunnelConfig};
 pub use link::{

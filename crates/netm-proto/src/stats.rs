@@ -18,16 +18,16 @@ pub struct Counters {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct Bucket {
+struct Sample {
     /// Offset from `RateMeter::epoch`.
-    start: Duration,
+    at: Duration,
     tx: u64,
     rx: u64,
 }
 
 #[derive(Debug)]
 struct Window {
-    buckets: VecDeque<Bucket>,
+    samples: VecDeque<Sample>,
 }
 
 /// Sliding-window throughput meter with cumulative counters.
@@ -35,13 +35,12 @@ struct Window {
 /// `RateMeter` is `Send + Sync`; wrap it in an `Arc` and call
 /// [`record_tx`](Self::record_tx) / [`record_rx`](Self::record_rx) from the
 /// packet pumps while the UI polls [`rates`](Self::rates) and
-/// [`counters`](Self::counters). Recording is cheap: atomics for the counters
-/// plus a short mutex hold to bump the current time bucket.
+/// [`counters`](Self::counters). The hot recording path is lock-free: the
+/// small sample deque is touched only when the UI asks for rates.
 #[derive(Debug)]
 pub struct RateMeter {
     epoch: Instant,
     window: Duration,
-    bucket_len: Duration,
     tx_bytes: AtomicU64,
     rx_bytes: AtomicU64,
     tx_packets: AtomicU64,
@@ -50,29 +49,25 @@ pub struct RateMeter {
 }
 
 impl Default for RateMeter {
-    /// One second window, 100 ms buckets.
+    /// One-second sampling window.
     fn default() -> Self {
         Self::new(Duration::from_secs(1))
     }
 }
 
 impl RateMeter {
-    /// Number of buckets the window is divided into.
-    const BUCKETS: u32 = 10;
-
     /// Create a meter averaging over `window` (must be non-zero).
     pub fn new(window: Duration) -> Self {
         assert!(!window.is_zero(), "RateMeter window must be non-zero");
         Self {
             epoch: Instant::now(),
             window,
-            bucket_len: window / Self::BUCKETS,
             tx_bytes: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
             inner: Mutex::new(Window {
-                buckets: VecDeque::with_capacity(Self::BUCKETS as usize + 1),
+                samples: VecDeque::from([Sample::default()]),
             }),
         }
     }
@@ -86,29 +81,35 @@ impl RateMeter {
     pub fn record_tx(&self, bytes: usize) {
         self.tx_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         self.tx_packets.fetch_add(1, Ordering::Relaxed);
-        self.bump(bytes as u64, 0);
     }
 
     /// Record one packet of `bytes` received from the tunnel.
     pub fn record_rx(&self, bytes: usize) {
         self.rx_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         self.rx_packets.fetch_add(1, Ordering::Relaxed);
-        self.bump(0, bytes as u64);
     }
 
     /// Current throughput in **bits per second** as `(tx_bps, rx_bps)`,
     /// averaged over the sliding window.
     pub fn rates(&self) -> (f64, f64) {
         let now = self.epoch.elapsed();
+        let current = Sample {
+            at: now,
+            tx: self.tx_bytes.load(Ordering::Relaxed),
+            rx: self.rx_bytes.load(Ordering::Relaxed),
+        };
         let mut w = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Self::prune(&mut w, now, self.window);
-        let (tx, rx) = w
-            .buckets
-            .iter()
-            .fold((0u64, 0u64), |(t, r), b| (t + b.tx, r + b.rx));
+        let base = w.samples.front().copied().unwrap_or(current);
+        if w.samples.back().map(|s| s.at) != Some(now) {
+            w.samples.push_back(current);
+        }
         drop(w);
-        let secs = self.window.as_secs_f64();
-        ((tx as f64) * 8.0 / secs, (rx as f64) * 8.0 / secs)
+        let seconds = self.window.max(now.saturating_sub(base.at)).as_secs_f64();
+        (
+            (current.tx.saturating_sub(base.tx) as f64) * 8.0 / seconds,
+            (current.rx.saturating_sub(base.rx) as f64) * 8.0 / seconds,
+        )
     }
 
     /// Snapshot of the cumulative counters.
@@ -127,45 +128,23 @@ impl RateMeter {
         self.rx_bytes.store(0, Ordering::Relaxed);
         self.tx_packets.store(0, Ordering::Relaxed);
         self.rx_packets.store(0, Ordering::Relaxed);
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .buckets
-            .clear();
-    }
-
-    fn bump(&self, tx: u64, rx: u64) {
         let now = self.epoch.elapsed();
         let mut w = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        Self::prune(&mut w, now, self.window);
-        let needs_new = match w.buckets.back() {
-            Some(b) => now >= b.start + self.bucket_len,
-            None => true,
-        };
-        if needs_new {
-            // Align bucket start to the bucket grid so buckets don't drift.
-            let idx = now.as_nanos() / self.bucket_len.as_nanos().max(1);
-            let start = Duration::from_nanos((idx * self.bucket_len.as_nanos()) as u64);
-            w.buckets.push_back(Bucket {
-                start,
-                tx: 0,
-                rx: 0,
-            });
-        }
-        let b = w.buckets.back_mut().expect("bucket just ensured");
-        b.tx += tx;
-        b.rx += rx;
+        w.samples.clear();
+        w.samples.push_back(Sample {
+            at: now,
+            tx: 0,
+            rx: 0,
+        });
     }
 
     fn prune(w: &mut Window, now: Duration, window: Duration) {
         let cutoff = now.saturating_sub(window);
-        while let Some(front) = w.buckets.front() {
-            // A bucket is stale once it ends before the cutoff.
-            if front.start + (window / Self::BUCKETS) <= cutoff {
-                w.buckets.pop_front();
-            } else {
-                break;
-            }
+        // Keep the newest sample at or before the cutoff as the baseline,
+        // plus all newer samples. This bounds memory to roughly the UI poll
+        // rate times the configured window.
+        while w.samples.len() > 1 && w.samples.get(1).is_some_and(|s| s.at <= cutoff) {
+            w.samples.pop_front();
         }
     }
 }

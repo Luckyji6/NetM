@@ -7,7 +7,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
@@ -260,6 +260,60 @@ async fn udp_flow_is_echoed_back_through_the_tunnel() {
         (b"ping-through-tunnel".len() + b"again".len()) as u64
     );
     assert_eq!(rx_bytes, tx_bytes);
+    host.shutdown().await;
+}
+
+/// Localhost-only latency regression benchmark for the full path:
+/// framing -> host packet pump -> ipstack -> UDP socket -> ipstack -> framing.
+/// It excludes TUN and the physical cable, so it is a prerequisite rather
+/// than a substitute for the two-Mac measurement.
+#[ignore = "run explicitly in release mode as a latency benchmark"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn benchmark_udp_round_trip_latency() {
+    const SAMPLES: u32 = 2_000;
+
+    let host = Host::start(Some(vec!["127.0.0.1:1".parse().unwrap()])).await;
+    let (mut guest, _) = connect_guest(host.addr).await;
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, from) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(&buf[..n], from).await.unwrap();
+        }
+    });
+
+    let src = SocketAddr::from((GUEST_IP, 40100));
+    // Warm the flow so socket creation and the first ipstack accept are not
+    // counted as steady-state game-packet latency.
+    guest
+        .send(Frame::IpPacket(udp_packet(src, echo_addr, b"warmup")))
+        .await
+        .unwrap();
+    let _ = next_ip_packet(&mut guest).await;
+
+    let mut samples_us = Vec::with_capacity(SAMPLES as usize);
+    for sequence in 0..SAMPLES {
+        let payload = sequence.to_be_bytes();
+        let started = Instant::now();
+        guest
+            .send(Frame::IpPacket(udp_packet(src, echo_addr, &payload)))
+            .await
+            .unwrap();
+        let reply = next_ip_packet(&mut guest).await;
+        assert_eq!(parse_udp(&reply).unwrap().payload, payload);
+        samples_us.push(started.elapsed().as_secs_f64() * 1e6);
+    }
+    samples_us.sort_by(f64::total_cmp);
+    let p50 = samples_us[(samples_us.len() - 1) / 2];
+    let p99 = samples_us[((samples_us.len() - 1) as f64 * 0.99) as usize];
+    println!("full host UDP path RTT: p50 {p50:.1} us, p99 {p99:.1} us");
+    if !cfg!(debug_assertions) {
+        assert!(p99 < 1_000.0, "release p99 latency exceeded 1 ms: {p99:.1} us");
+    }
+
+    guest.send(Frame::Bye).await.unwrap();
     host.shutdown().await;
 }
 

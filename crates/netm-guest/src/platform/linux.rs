@@ -336,7 +336,7 @@ mod tests {
             argvs(&log.lock().unwrap()),
             vec![
                 "ip -4 addr show dev tun0",
-                "ip link set dev tun0 mtu 1400 up",
+                "ip link set dev tun0 mtu 9000 up",
                 "ip route add 0.0.0.0/1 dev tun0",
                 "ip route add 128.0.0.0/1 dev tun0",
                 "resolvectl status",
@@ -417,7 +417,7 @@ mod tests {
             vec![
                 "ip -4 addr show dev tun1",
                 "ip addr add 10.77.0.2 peer 10.77.0.1/24 dev tun1",
-                "ip link set dev tun1 mtu 1400 up",
+                "ip link set dev tun1 mtu 9000 up",
                 "ip route add 1.1.1.1/32 dev tun1",
                 "resolvectl status",
                 "test -e /etc/resolv.conf.netm-backup",

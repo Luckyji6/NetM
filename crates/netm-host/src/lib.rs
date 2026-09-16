@@ -327,7 +327,7 @@ pub async fn run(
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
-                    let _ = stream.set_nodelay(true);
+                    let _ = netm_proto::transport::tcp::tune(&stream);
                     let busy = matches!(&current, Some((_, h)) if !h.is_finished());
                     if busy {
                         let active = current.as_ref().map(|(p, _)| *p).unwrap_or(peer);
