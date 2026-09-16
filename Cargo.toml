@@ -31,3 +31,9 @@ postcard = { version = "1.1", features = ["use-std"] }
 socket2 = { version = "0.6", features = ["all"] }
 nix = { version = "0.31", features = ["net", "user"] }
 if-addrs = "0.15"
+
+# Host: user-space TCP/IP stack and packet building/parsing
+ipstack = "1.0.1"
+etherparse = "0.20"
+anyhow = "1.0"
+hostname = "0.4"

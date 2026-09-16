@@ -8,3 +8,18 @@ authors.workspace = true
 
 [dependencies]
 netm-proto = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+ipstack = { workspace = true }
+etherparse = { workspace = true }
+hostname = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
