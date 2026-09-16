@@ -13,12 +13,27 @@
 //! (see [`Responder::bind`]); the guest must set `IPV6_MULTICAST_IF` to the
 //! probed interface, which [`probe`] does.
 //!
+//! The responder is **self-healing**: [`Responder::run`] re-enumerates the
+//! interfaces every [`JOIN_REFRESH_INTERVAL`] via
+//! [`list_all_interfaces`](crate::link::list_all_interfaces) and joins the
+//! group on every interface it is not yet a member of (retrying earlier
+//! failures, and re-joining interfaces that disappeared and came back). This
+//! matters in practice: a Type-C/USB Ethernet link between two Macs creates a
+//! brand-new interface (`en8`) only when the cable is plugged in, and the
+//! caller's candidate list — built from `networksetup` — may not include it
+//! for a while, or the host may have been started before the cable was
+//! connected. Without the refresh the host would keep answering *unicast*
+//! probes but never see the guest's `ff02::1` probe, exactly the "guest stuck
+//! at 发现宿主机中, host stuck at 等待客机连接" symptom.
+//!
 //! Wire encoding: 4 magic bytes `b"NETM"` followed by the postcard encoding of
 //! [`DiscoveryMessage`]. Datagrams without the magic prefix are ignored.
 
+use std::collections::HashSet;
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +55,10 @@ const MAX_DATAGRAM: usize = 512;
 /// Interval at which [`probe`] re-sends its `Probe` while waiting for an
 /// `Offer`.
 const PROBE_RESEND_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often [`Responder::run`] re-enumerates interfaces to join `ff02::1` on
+/// links that appeared after it started.
+pub const JOIN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Discovery datagram.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -118,6 +137,16 @@ pub struct Responder {
     socket: UdpSocket,
     data_port: u16,
     host_name: String,
+    /// Interface indices the socket is currently a member of, and the ones
+    /// whose join already failed (so the failure is logged once, not every
+    /// [`JOIN_REFRESH_INTERVAL`]).
+    memberships: Mutex<Memberships>,
+}
+
+#[derive(Default)]
+struct Memberships {
+    joined: HashSet<u32>,
+    failed: HashSet<u32>,
 }
 
 impl Responder {
@@ -158,6 +187,7 @@ impl Responder {
             socket,
             data_port,
             host_name,
+            memberships: Mutex::new(Memberships::default()),
         };
         for iface in interfaces {
             // Errors are already logged by `join`.
@@ -168,27 +198,65 @@ impl Responder {
 
     /// Join `ff02::1` on `iface` so probes arriving on that link are received.
     ///
-    /// Interfaces with `index == 0` are ignored (returns `Ok`). Failures are
-    /// logged at `warn` and returned; see [`bind`](Self::bind) for the benign
-    /// macOS `EINVAL` case on bridge member ports.
+    /// Idempotent: joining an interface the socket is already a member of is a
+    /// no-op. Interfaces with `index == 0` are ignored (returns `Ok`).
+    /// Failures are returned, and logged at `warn` the first time only; see
+    /// [`bind`](Self::bind) for the benign macOS `EINVAL` case on bridge
+    /// member ports.
     pub fn join(&self, iface: &LinkInterface) -> io::Result<()> {
         if iface.index == 0 {
             return Ok(());
         }
+        let mut m = self.lock_memberships();
+        if m.joined.contains(&iface.index) {
+            return Ok(());
+        }
         match self.socket.join_multicast_v6(&MULTICAST_GROUP, iface.index) {
             Ok(()) => {
+                m.joined.insert(iface.index);
+                m.failed.remove(&iface.index);
                 tracing::debug!(iface = %iface.name, index = iface.index, "joined ff02::1");
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!(
-                    iface = %iface.name,
-                    index = iface.index,
-                    error = %e,
-                    "could not join ff02::1 on interface (probes on it will not be seen)"
-                );
+                if m.failed.insert(iface.index) {
+                    tracing::warn!(
+                        iface = %iface.name,
+                        index = iface.index,
+                        error = %e,
+                        "could not join ff02::1 on interface (probes on it will not be seen)"
+                    );
+                }
                 Err(e)
             }
+        }
+    }
+
+    fn lock_memberships(&self) -> std::sync::MutexGuard<'_, Memberships> {
+        // A poisoned mutex only means a previous caller panicked while holding
+        // it; the set is still consistent enough to keep answering probes.
+        self.memberships.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Join the group on every interface that appeared since the last call and
+    /// forget the ones that went away, so they are re-joined if they come
+    /// back (the kernel drops the membership with the interface).
+    fn refresh_memberships(&self) {
+        let ifaces = match crate::link::list_all_interfaces() {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::debug!(error = %e, "interface enumeration failed; keeping current memberships");
+                return;
+            }
+        };
+        {
+            let mut m = self.lock_memberships();
+            let present: HashSet<u32> = ifaces.iter().map(|i| i.index).collect();
+            m.joined.retain(|i| present.contains(i));
+            m.failed.retain(|i| present.contains(i));
+        }
+        for iface in &ifaces {
+            let _ = self.join(iface);
         }
     }
 
@@ -197,19 +265,29 @@ impl Responder {
         self.socket.local_addr()
     }
 
-    /// Serve forever: reply an `Offer` to the sender of every valid `Probe`.
+    /// Serve forever: reply an `Offer` to the sender of every valid `Probe`,
+    /// re-joining `ff02::1` on new interfaces every
+    /// [`JOIN_REFRESH_INTERVAL`].
     ///
     /// Returns only on a fatal socket error. Run it in its own task and drop
     /// the task handle (or `abort()` it) to stop responding.
     pub async fn run(self) -> io::Result<()> {
         let mut buf = [0u8; MAX_DATAGRAM];
+        let mut refresh = tokio::time::interval(JOIN_REFRESH_INTERVAL);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let (n, from) = match self.socket.recv_from(&mut buf).await {
-                Ok(v) => v,
-                // Transient errors (e.g. ICMP port unreachable surfaced on some
-                // platforms) should not kill the responder.
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
-                Err(e) => return Err(e),
+            let (n, from) = tokio::select! {
+                res = self.socket.recv_from(&mut buf) => match res {
+                    Ok(v) => v,
+                    // Transient errors (e.g. ICMP port unreachable surfaced on
+                    // some platforms) should not kill the responder.
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                    Err(e) => return Err(e),
+                },
+                _ = refresh.tick() => {
+                    self.refresh_memberships();
+                    continue;
+                }
             };
             let Some(msg) = DiscoveryMessage::decode(&buf[..n]) else {
                 tracing::trace!(%from, len = n, "ignoring non-NetM datagram");
@@ -398,6 +476,52 @@ mod tests {
         assert_eq!(found.host_addr.ip(), &Ipv6Addr::LOCALHOST);
         assert_eq!(found.host_addr.port(), 4242);
         task.abort();
+    }
+
+    /// The field regression: the host was started *before* the Type-C cable
+    /// was plugged in, so it had nothing to join `ff02::1` on, and the guest's
+    /// multicast probes were dropped forever. `run` must recover on its own.
+    ///
+    /// Requires a link with a carrier and a link-local address; skipped when
+    /// the machine has none.
+    #[tokio::test]
+    async fn responder_joins_interfaces_that_appear_after_bind() {
+        let Some(iface) = crate::link::list_candidate_interfaces()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|i| i.is_ready())
+        else {
+            return;
+        };
+        // Empty interface list: exactly the "no cable at startup" situation.
+        let responder = Responder::bind_with_port(&[], 0, 4242, "late-host".to_string())
+            .await
+            .unwrap();
+        let port = responder.local_addr().unwrap().port();
+        let task = tokio::spawn(responder.run());
+
+        let socket = new_v6_udp_socket().unwrap();
+        socket.set_multicast_if_v6(iface.index).unwrap();
+        socket.set_multicast_hops_v6(1).unwrap();
+        socket
+            .bind(&SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)).into())
+            .unwrap();
+        let client = UdpSocket::from_std(socket.into()).unwrap();
+
+        let found = probe_with_socket(
+            &client,
+            &iface,
+            MULTICAST_GROUP,
+            port,
+            JOIN_REFRESH_INTERVAL * 3,
+        )
+        .await
+        .unwrap();
+        task.abort();
+        let found = found.expect("responder must join the live link on its own");
+        assert_eq!(found.host_name, "late-host");
+        assert_eq!(found.host_addr.port(), 4242);
+        assert_eq!(found.host_addr.scope_id(), iface.index);
     }
 
     #[tokio::test]
