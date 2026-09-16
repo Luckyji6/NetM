@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.2.0"
+version = "0.3.0"
 license = "MIT"
 repository = ""
 authors = ["Luckyji6 <lucky123456jx@qq.com>"]
@@ -38,6 +38,8 @@ postcard = { version = "1.1", features = ["use-std"] }
 socket2 = { version = "0.6", features = ["all"] }
 nix = { version = "0.31", features = ["net", "user"] }
 if-addrs = "0.15"
+# USB serial fallback transport (netm-proto)
+tokio-serial = "5.5.0"
 # Windows only: elevation check (netm-proto)
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
 

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use netm_guest::{GuestConfig, HostTarget, RouteMode};
-use netm_host::HostConfig;
+use netm_host::{HostConfig, SerialSettings};
 
 #[cfg(test)]
 use crate::config::Mode;
@@ -51,6 +51,14 @@ pub struct HostArgs {
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
 
+    /// 同时在这个 USB 串口上等待客机（例如 /dev/tty.usbmodem1234）
+    #[arg(long, value_name = "PATH")]
+    pub serial: Option<String>,
+
+    /// 串口波特率（默认 921600；USB CDC 通常忽略此值）
+    #[arg(long, value_name = "BAUD", requires = "serial")]
+    pub baud: Option<u32>,
+
     /// 不进入 TUI，只在 stderr 打日志，直到 Ctrl-C / SIGTERM
     #[arg(long)]
     pub headless: bool,
@@ -63,8 +71,16 @@ pub struct GuestArgs {
     pub routes: Vec<ipnet::Ipv4Net>,
 
     /// 直接连接指定宿主机地址而不自动发现，如 "[fe80::1%bridge0]:27778"
-    #[arg(long, value_name = "ADDR", value_parser = parse_host)]
+    #[arg(long, value_name = "ADDR", value_parser = parse_host, conflicts_with = "serial")]
     pub host: Option<SocketAddr>,
+
+    /// 通过 USB 串口连接宿主机，而不是 Type-C 网络链路
+    #[arg(long, value_name = "PATH", conflicts_with = "host")]
+    pub serial: Option<String>,
+
+    /// 串口波特率（默认 921600；USB CDC 通常忽略此值）
+    #[arg(long, value_name = "BAUD", requires = "serial")]
+    pub baud: Option<u32>,
 
     /// 不修改系统 DNS
     #[arg(long)]
@@ -133,6 +149,14 @@ impl Cli {
         if let Some(h) = g.host {
             out.push("--host".into());
             out.push(h.to_string());
+        }
+        if let Some(path) = g.serial {
+            out.push("--serial".into());
+            out.push(path);
+        }
+        if let Some(baud) = g.baud {
+            out.push("--baud".into());
+            out.push(baud.to_string());
         }
         if g.no_dns {
             out.push("--no-dns".into());
@@ -207,11 +231,23 @@ pub fn build_guest_config(args: &GuestArgs, cfg: &Config) -> Result<GuestConfig>
         }
     }
     let dns = set_dns(args.no_dns, &cfg.guest, &routes);
+    let host = if let Some(path) = &args.serial {
+        HostTarget::Serial {
+            path: path.clone(),
+            baud: args.baud.unwrap_or(cfg.guest.baud),
+        }
+    } else if let Some(addr) = args.host {
+        HostTarget::Manual(addr)
+    } else if let Some(path) = &cfg.guest.serial {
+        HostTarget::Serial {
+            path: path.clone(),
+            baud: cfg.guest.baud,
+        }
+    } else {
+        HostTarget::Auto
+    };
     Ok(GuestConfig {
-        host: args
-            .host
-            .map(HostTarget::Manual)
-            .unwrap_or(HostTarget::Auto),
+        host,
         routes,
         set_dns: dns,
         reconnect: true,
@@ -222,7 +258,14 @@ pub fn build_guest_config(args: &GuestArgs, cfg: &Config) -> Result<GuestConfig>
 /// Build the host configuration: `--port` beats `[host].port`.
 pub fn build_host_config(args: &HostArgs, saved: &HostSettings) -> HostConfig {
     let port = args.port.unwrap_or(saved.port);
-    HostConfig::default().with_port(port)
+    let mut cfg = HostConfig::default().with_port(port);
+    if let Some(path) = args.serial.as_ref().or(saved.serial.as_ref()) {
+        cfg.serial = Some(SerialSettings {
+            path: path.clone(),
+            baud: args.baud.unwrap_or(saved.baud),
+        });
+    }
+    cfg
 }
 
 #[cfg(test)]
@@ -255,8 +298,63 @@ mod tests {
         assert_eq!(hc.effective_bind_addr().port(), 30000);
 
         let cli = parse(&["host"]);
-        let hc = build_host_config(&cli.host_args(), &HostSettings { port: 31000 });
+        let hc = build_host_config(
+            &cli.host_args(),
+            &HostSettings {
+                port: 31000,
+                ..HostSettings::default()
+            },
+        );
         assert_eq!(hc.effective_bind_addr().port(), 31000);
+    }
+
+    #[test]
+    fn serial_transport_args_build_both_roles_and_survive_reexec() {
+        let host = parse(&[
+            "host",
+            "--serial",
+            "/dev/tty.usbmodem-host",
+            "--baud",
+            "460800",
+        ]);
+        let hc = build_host_config(&host.host_args(), &HostSettings::default());
+        let serial = hc.serial.expect("host serial settings");
+        assert_eq!(serial.path, "/dev/tty.usbmodem-host");
+        assert_eq!(serial.baud, 460_800);
+
+        let guest = parse(&[
+            "guest",
+            "--serial",
+            "/dev/tty.usbmodem-guest",
+            "--baud",
+            "230400",
+        ]);
+        let gc = build_guest_config(&guest.guest_args(), &Config::default()).unwrap();
+        assert!(matches!(
+            gc.host,
+            HostTarget::Serial { ref path, baud }
+                if path == "/dev/tty.usbmodem-guest" && baud == 230_400
+        ));
+        assert_eq!(
+            guest.reexec_guest_args(),
+            vec![
+                "guest",
+                "--serial",
+                "/dev/tty.usbmodem-guest",
+                "--baud",
+                "230400"
+            ]
+        );
+
+        assert!(Cli::try_parse_from([
+            "netm",
+            "guest",
+            "--host",
+            "127.0.0.1:27778",
+            "--serial",
+            "/dev/tty.usbmodem-guest"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -293,6 +391,7 @@ mod tests {
             guest: GuestSettings {
                 set_dns: Some(true),
                 routes: vec!["10.1.0.0/16".into()],
+                ..GuestSettings::default()
             },
             ..Config::default()
         };
@@ -320,6 +419,7 @@ mod tests {
             guest: GuestSettings {
                 set_dns: None,
                 routes: vec!["not-a-cidr".into()],
+                ..GuestSettings::default()
             },
             ..Config::default()
         };
@@ -333,7 +433,7 @@ mod tests {
         let gc = build_guest_config(&cli.guest_args(), &Config::default()).unwrap();
         match gc.host {
             HostTarget::Manual(a) => assert_eq!(a.to_string(), "[fe80::1%5]:27778"),
-            HostTarget::Auto => panic!(),
+            HostTarget::Auto | HostTarget::Serial { .. } => panic!(),
         }
     }
 

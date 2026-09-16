@@ -230,6 +230,17 @@ fn describe_host(ev: &HostEvent) -> Option<(Level, String)> {
                 },
             )
         }
+        HostEvent::SerialState { path, open } => (
+            Level::Info,
+            format!(
+                "串口 {path} {}",
+                if *open {
+                    "已打开，等待客机"
+                } else {
+                    "已关闭"
+                }
+            ),
+        ),
         HostEvent::GuestConnected(g) => (
             Level::Info,
             format!(
@@ -246,7 +257,7 @@ fn describe_host(ev: &HostEvent) -> Option<(Level, String)> {
         HostEvent::LinkSpeed(s) => (
             Level::Info,
             format!(
-                "线路测速（Type-C，不是互联网）：上行 {}（客机→宿主机），下行 {}（宿主机→客机）",
+                "传输链路测速（不是互联网）：上行 {}（客机→宿主机），下行 {}（宿主机→客机）",
                 crate::format::fmt_bps(s.up_bps),
                 crate::format::fmt_bps(s.down_bps)
             ),
@@ -305,7 +316,7 @@ fn describe_guest(ev: &GuestEvent) -> Option<(Level, String)> {
         GuestEvent::LinkSpeed(s) => (
             Level::Info,
             format!(
-                "线路测速（Type-C，不是互联网）：上行 {}（客机→宿主机），下行 {}（宿主机→客机）",
+                "传输链路测速（不是互联网）：上行 {}（客机→宿主机），下行 {}（宿主机→客机）",
                 crate::format::fmt_bps(s.up_bps),
                 crate::format::fmt_bps(s.down_bps)
             ),
@@ -440,7 +451,7 @@ mod tests {
         assert!(msg.contains("27778"));
         let (lvl, msg) = describe(&Event::Host(HostEvent::GuestConnected(
             netm_host::GuestInfo {
-                peer: addr,
+                peer: addr.into(),
                 name: "mbp".into(),
                 connected_at: std::time::Instant::now(),
                 assigned_ip: Ipv4Addr::new(10, 77, 0, 2),

@@ -294,6 +294,7 @@ pub struct HostModel {
     pub listening: Option<SocketAddr>,
     pub host_name: String,
     pub interfaces: Vec<LinkInterface>,
+    pub serial_state: Option<(String, bool)>,
     pub guest: Option<netm_host::GuestInfo>,
     pub last_disconnect: Option<String>,
     pub flows: FlowTable,
@@ -316,6 +317,9 @@ impl HostModel {
         match ev {
             HostEvent::Listening { addr } => self.listening = Some(*addr),
             HostEvent::Interfaces(list) => self.interfaces = list.clone(),
+            HostEvent::SerialState { path, open } => {
+                self.serial_state = Some((path.clone(), *open));
+            }
             HostEvent::GuestConnected(g) => {
                 self.guest = Some(g.clone());
                 self.last_disconnect = None;
@@ -404,10 +408,18 @@ mod tests {
         let addr: SocketAddr = "[::]:27778".parse().unwrap();
         m.apply(&HostEvent::Listening { addr });
         assert_eq!(m.listening, Some(addr));
+        m.apply(&HostEvent::SerialState {
+            path: "/dev/tty.usbmodem-test".into(),
+            open: true,
+        });
+        assert_eq!(
+            m.serial_state,
+            Some(("/dev/tty.usbmodem-test".into(), true))
+        );
 
         let peer: SocketAddr = "[fe80::1]:5000".parse().unwrap();
         m.apply(&HostEvent::GuestConnected(netm_host::GuestInfo {
-            peer,
+            peer: peer.into(),
             name: "win".into(),
             connected_at: Instant::now(),
             assigned_ip: Ipv4Addr::new(10, 77, 0, 2),
@@ -425,7 +437,7 @@ mod tests {
 
         m.apply(&HostEvent::FlowOpened(flow(8, Proto::Udp)));
         m.apply(&HostEvent::GuestDisconnected {
-            peer,
+            peer: peer.into(),
             reason: "bye".into(),
         });
         assert!(m.guest.is_none());
@@ -458,9 +470,9 @@ mod tests {
             }),
             "发现宿主机中"
         );
-        let host: SocketAddr = "[fe80::1%5]:27778".parse().unwrap();
+        let host = netm_proto::Endpoint::Tcp("[fe80::1%5]:27778".parse().unwrap());
         assert_eq!(
-            guest_state_label(&GuestState::Connecting { host }),
+            guest_state_label(&GuestState::Connecting { host: host.clone() }),
             "正在连接"
         );
         let connected = GuestState::Connected {

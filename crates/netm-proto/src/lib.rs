@@ -6,7 +6,8 @@
 //!
 //! Modules:
 //! - [`frame`]: length-prefixed frame protocol ([`frame::Frame`], [`frame::FrameCodec`]).
-//! - [`transport`]: the [`transport::Transport`] trait plus a TCP implementation.
+//! - [`transport`]: the [`transport::Transport`] trait, [`transport::Endpoint`],
+//!   TCP helpers and the USB serial fallback ([`transport::serial`]).
 //! - [`discovery`]: IPv6 link-local multicast discovery (`ff02::1`).
 //! - [`link`]: enumeration of Thunderbolt / USB Ethernet interfaces.
 //! - [`privilege`]: privilege checks.
@@ -22,10 +23,6 @@ pub mod transport;
 
 /// Protocol version carried in `Hello` frames and discovery messages. Peers
 /// with a different version must not talk to each other.
-///
-/// Version 2 adds the link-capacity frames (types 7-9). This must differ from
-/// the original protocol: a v1 peer cannot decode those frames and would
-/// otherwise accept the handshake before dropping the connection.
 pub const PROTOCOL_VERSION: u16 = 2;
 
 /// UDP port used for link-local multicast discovery (`ff02::1`).
@@ -42,11 +39,14 @@ pub const DATA_PORT: u16 = 27778;
 /// host's real sockets still use the egress interface's actual MTU.
 pub const DEFAULT_MTU: u16 = 9000;
 
-pub use frame::{framed, Frame, FrameCodec, FrameError, FramedTransport, TunnelConfig};
+pub use frame::{
+    framed, framed_sync, Frame, FrameCodec, FrameError, FrameIo, FramedTransport, SyncFrameCodec,
+    SyncFramedTransport, TunnelConfig,
+};
 pub use link::{
     list_candidate_interfaces, list_neighbors, neighbor_data_addr, LinkInterface, LinkKind,
     Neighbor,
 };
 pub use speed::LinkSpeed;
 pub use stats::{Counters, RateMeter};
-pub use transport::Transport;
+pub use transport::{Endpoint, Transport};

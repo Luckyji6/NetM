@@ -437,7 +437,7 @@ fn render_host_header(app: &App, m: &HostModel, frame: &mut Frame, area: Rect) {
     ));
 
     let mut second = vec![Span::styled(" 链路 ", Style::new().fg(DIM))];
-    if m.interfaces.is_empty() {
+    if m.interfaces.is_empty() && m.serial_state.is_none() {
         second.push(Span::styled("（未发现候选网卡）", Style::new().fg(DIM)));
     }
     for (i, l) in m.interfaces.iter().enumerate() {
@@ -456,6 +456,23 @@ fn render_host_header(app: &App, m: &HostModel, frame: &mut Frame, area: Rect) {
         second.push(Span::styled(
             format!("({})", if ready { "已连线" } else { "未连线" }),
             Style::new().fg(if ready { OK } else { DIM }),
+        ));
+    }
+    if let Some((path, open)) = &m.serial_state {
+        if !m.interfaces.is_empty() {
+            second.push(Span::raw("  "));
+        }
+        second.push(Span::styled(
+            format!("串口 {path}"),
+            if *open {
+                Style::new().fg(OK).bold()
+            } else {
+                Style::new().fg(DIM)
+            },
+        ));
+        second.push(Span::styled(
+            format!("({})", if *open { "已打开" } else { "已关闭" }),
+            Style::new().fg(if *open { OK } else { DIM }),
         ));
     }
     let block = Block::bordered()
@@ -803,7 +820,7 @@ mod tests {
 
         if let Screen::Guest(m) = &mut a.screen {
             m.state = GuestState::Connected {
-                host: "[fe80::1%20]:27778".parse().unwrap(),
+                host: netm_proto::Endpoint::Tcp("[fe80::1%20]:27778".parse().unwrap()),
                 host_name: "mac-host".into(),
                 tun: "utun4".into(),
                 config: Default::default(),
@@ -830,7 +847,7 @@ mod tests {
         m.listening = Some("[::]:27778".parse().unwrap());
         m.interfaces = ifaces();
         m.guest = Some(GuestInfo {
-            peer: "[fe80::2%20]:50000".parse().unwrap(),
+            peer: netm_proto::Endpoint::Tcp("[fe80::2%20]:50000".parse().unwrap()),
             name: "win-guest".into(),
             connected_at: Instant::now(),
             assigned_ip: "10.77.0.2".parse().unwrap(),

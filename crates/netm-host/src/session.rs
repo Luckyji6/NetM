@@ -2,13 +2,16 @@
 //! IP stack that turns the guest's packets into flows.
 //!
 //! ```text
-//!   guest ──TCP──▶ Framed ─┬─ IpPacket ──▶ PacketDevice ──▶ IpStack ──▶ flows ──▶ real sockets
-//!                          ├─ Ping ──────▶ Pong
-//!                          └─ Bye
-//!   guest ◀──TCP── Framed ◀── writer task ◀── {control frames, IpPackets from the stack}
+//!   guest ──TCP/serial──▶ Framed ─┬─ IpPacket ──▶ PacketDevice ──▶ IpStack ──▶ flows ──▶ real sockets
+//!                                 ├─ Ping ──────▶ Pong
+//!                                 └─ Bye
+//!   guest ◀──TCP/serial── Framed ◀── writer task ◀── {control frames, IpPackets from the stack}
 //! ```
+//!
+//! The session is written against [`FrameIo`] (any framed stream), so the
+//! same code serves a TCP connection wrapped in `FrameCodec` and a serial
+//! port wrapped in the resynchronising `SyncFrameCodec`.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,7 +20,7 @@ use bytes::Bytes;
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use ipstack::{IpStack, IpStackConfig, IpStackStream, TcpConfig};
-use netm_proto::{Frame, FrameError, FramedTransport, RateMeter, Transport, PROTOCOL_VERSION};
+use netm_proto::{Endpoint, Frame, FrameError, FrameIo, RateMeter, Transport, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -99,15 +102,12 @@ fn frame_kind(f: &Frame) -> &'static str {
 
 /// Run the handshake on a framed transport. On success the guest name is
 /// returned; on failure a `Bye` has been sent and the reason is returned.
-pub async fn handshake<T: Transport>(
-    framed: &mut FramedTransport<T>,
-    shared: &Shared,
-) -> Result<String, String> {
+pub async fn handshake<S: FrameIo>(framed: &mut S, shared: &Shared) -> Result<String, String> {
     handshake_with_timeout(framed, shared, HANDSHAKE_TIMEOUT).await
 }
 
-async fn handshake_with_timeout<T: Transport>(
-    framed: &mut FramedTransport<T>,
+async fn handshake_with_timeout<S: FrameIo>(
+    framed: &mut S,
     shared: &Shared,
     timeout: Duration,
 ) -> Result<String, String> {
@@ -154,15 +154,68 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Wait (without a timeout) for a valid `Hello` on a link that stays open
+/// between sessions (serial). Frames that are not a `Hello` are ignored:
+/// they are leftovers of a previous session or noise. A `Hello` with a
+/// foreign protocol version is answered with `Bye` and the wait continues.
+///
+/// Returns `Ok(None)` when `cancel` fires, `Err` when the link is closed or
+/// reports an I/O error (the caller reopens the port).
+pub async fn wait_for_hello<S: FrameIo>(
+    framed: &mut S,
+    shared: &Shared,
+    cancel: &CancellationToken,
+) -> Result<Option<String>, String> {
+    loop {
+        let first = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(None),
+            f = framed.next() => f,
+        };
+        match first {
+            None => return Err("link closed".into()),
+            Some(Err(e)) => return Err(format!("read error: {e}")),
+            Some(Ok(Frame::Hello { .. })) => match check_hello(first) {
+                HelloCheck::Accept(name) => {
+                    for f in hello_reply(shared) {
+                        framed
+                            .feed(f)
+                            .await
+                            .map_err(|e| format!("handshake write: {e}"))?;
+                    }
+                    framed
+                        .flush()
+                        .await
+                        .map_err(|e| format!("handshake write: {e}"))?;
+                    return Ok(Some(name));
+                }
+                HelloCheck::Reject(reason) => {
+                    shared
+                        .events
+                        .log(format!("serial guest rejected: {reason}"))
+                        .await;
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(1), framed.send(Frame::Bye)).await;
+                }
+            },
+            Some(Ok(other)) => {
+                tracing::debug!(
+                    kind = frame_kind(&other),
+                    "ignoring frame while waiting for Hello"
+                );
+            }
+        }
+    }
+}
+
 /// Drive one guest connection to completion. Returns once the guest is gone
 /// or `cancel` fires; emits `GuestConnected` / `GuestDisconnected`.
-pub async fn run_session<T: Transport>(
-    transport: T,
-    peer: SocketAddr,
+pub async fn run_session<S: FrameIo + 'static>(
+    mut framed: S,
+    peer: Endpoint,
     shared: Arc<Shared>,
     cancel: CancellationToken,
 ) {
-    let mut framed = netm_proto::framed(transport);
     let name = match handshake(&mut framed, &shared).await {
         Ok(name) => name,
         Err(reason) => {
@@ -173,10 +226,39 @@ pub async fn run_session<T: Transport>(
             return;
         }
     };
+    serve_connected(framed, peer, name, shared, cancel).await;
+}
+
+/// Everything after a successful handshake: claim the single guest slot,
+/// announce the guest, pump until the session ends, announce the end.
+///
+/// Returns the disconnect reason, or `None` when another guest already holds
+/// the slot (a `Bye` has been sent in that case).
+pub async fn serve_connected<S: FrameIo + 'static>(
+    mut framed: S,
+    peer: Endpoint,
+    name: String,
+    shared: Arc<Shared>,
+    cancel: CancellationToken,
+) -> Option<String> {
+    if !shared.claim_guest(&peer) {
+        let active = shared
+            .active_guest()
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        shared
+            .events
+            .log(format!(
+                "rejecting guest \"{name}\" from {peer}: {active} is already connected"
+            ))
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), framed.send(Frame::Bye)).await;
+        return None;
+    }
     shared
         .events
         .send(HostEvent::GuestConnected(GuestInfo {
-            peer,
+            peer: peer.clone(),
             name: name.clone(),
             connected_at: Instant::now(),
             assigned_ip: shared.tunnel.guest_ip,
@@ -190,7 +272,7 @@ pub async fn run_session<T: Transport>(
         ))
         .await;
 
-    let pending = match netm_proto::speed::run_as_responder(
+    let reason = match netm_proto::speed::run_as_responder(
         &mut framed,
         netm_proto::speed::Params::default(),
     )
@@ -199,28 +281,14 @@ pub async fn run_session<T: Transport>(
         Ok(netm_proto::speed::ResponderOutcome::Measured(speed)) => {
             tracing::info!(summary = %speed.summary(), "link capacity");
             shared.events.send(HostEvent::LinkSpeed(speed)).await;
-            None
+            pump(framed, None, &shared, cancel).await
         }
-        Ok(netm_proto::speed::ResponderOutcome::Skipped { pending }) => pending,
-        Err(e) => {
-            shared
-                .events
-                .log(format!(
-                    "guest \"{name}\" ({peer}) disconnected: speed test: {e}"
-                ))
-                .await;
-            shared
-                .events
-                .send(HostEvent::GuestDisconnected {
-                    peer,
-                    reason: format!("speed test: {e}"),
-                })
-                .await;
-            return;
+        Ok(netm_proto::speed::ResponderOutcome::Skipped { pending }) => {
+            pump(framed, pending, &shared, cancel).await
         }
+        Err(e) => format!("speed test: {e}"),
     };
-
-    let reason = pump(framed, pending, &shared, cancel).await;
+    shared.release_guest(&peer);
 
     shared
         .events
@@ -228,11 +296,15 @@ pub async fn run_session<T: Transport>(
         .await;
     shared
         .events
-        .send(HostEvent::GuestDisconnected { peer, reason })
+        .send(HostEvent::GuestDisconnected {
+            peer,
+            reason: reason.clone(),
+        })
         .await;
+    Some(reason)
 }
 
-/// Handle one guest frame. `Some` is a disconnect reason.
+/// Handle one already-decoded session frame. `Some` is a disconnect reason.
 fn ingest_frame(
     frame: Frame,
     shared: &Arc<Shared>,
@@ -252,8 +324,8 @@ fn ingest_frame(
             }
             None
         }
-        Frame::Ping(t) => {
-            let _ = ctrl_tx.try_send(Frame::Pong(t));
+        Frame::Ping(token) => {
+            let _ = ctrl_tx.try_send(Frame::Pong(token));
             None
         }
         Frame::Pong(_) => {
@@ -261,6 +333,9 @@ fn ingest_frame(
             None
         }
         Frame::Bye => Some("guest sent Bye".into()),
+        // Serial links persist across sessions. A new Hello means the guest
+        // restarted, so reopen the session and answer its new handshake.
+        Frame::Hello { .. } => Some("guest restarted (new Hello)".into()),
         other => {
             tracing::debug!(kind = frame_kind(&other), "ignoring unexpected frame");
             None
@@ -285,8 +360,8 @@ fn stack_config(shared: &Shared) -> IpStackConfig {
 }
 
 /// The frame pump; returns the disconnect reason.
-async fn pump<T: Transport>(
-    framed: FramedTransport<T>,
+async fn pump<S: FrameIo + 'static>(
+    framed: S,
     pending: Option<Frame>,
     shared: &Arc<Shared>,
     cancel: CancellationToken,
@@ -310,63 +385,59 @@ async fn pump<T: Transport>(
     let dropped_packets = AtomicUsize::new(0);
     let mut unknown_network: u64 = 0;
 
-    if let Some(frame) = pending {
-        if let Some(reason) = ingest_frame(
+    let initial_reason = pending.and_then(|frame| {
+        ingest_frame(
             frame,
             shared,
             &to_stack,
             &ctrl_tx,
             &dropped_packets,
             &mut missed_pings,
-        ) {
-            flows_cancel.cancel();
-            let _ = ctrl_tx.try_send(Frame::Bye);
-            drop(ctrl_tx);
-            drop(to_stack);
-            drop(stack);
-            let _ = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
-            return reason;
-        }
-    }
+        )
+    });
 
-    let reason = loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break "host shutting down".to_string(),
-            frame = source.next() => match frame {
-                Some(Ok(frame)) => {
-                    if let Some(reason) = ingest_frame(
-                        frame,
-                        shared,
-                        &to_stack,
-                        &ctrl_tx,
-                        &dropped_packets,
-                        &mut missed_pings,
-                    ) {
-                        break reason;
+    let reason = if let Some(reason) = initial_reason {
+        reason
+    } else {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break "host shutting down".to_string(),
+                frame = source.next() => match frame {
+                    Some(Ok(frame)) => {
+                        if let Some(reason) = ingest_frame(
+                            frame,
+                            shared,
+                            &to_stack,
+                            &ctrl_tx,
+                            &dropped_packets,
+                            &mut missed_pings,
+                        ) {
+                            break reason;
+                        }
                     }
-                }
-                Some(Err(e)) => break format!("read error: {e}"),
-                None => break "connection closed by guest".to_string(),
-            },
-            _ = ping.tick() => {
-                if missed_pings >= MAX_MISSED_PINGS {
-                    break format!("keep-alive timeout ({MAX_MISSED_PINGS} pings unanswered)");
-                }
-                missed_pings += 1;
-                if ctrl_tx.try_send(Frame::Ping(now_millis())).is_err() {
-                    tracing::debug!("control queue full, ping skipped");
-                }
-            },
-            accepted = stack.accept() => match accepted {
-                Ok(stream) => dispatch(shared, stream, &flows_cancel, &mut unknown_network),
-                Err(e) => break format!("ip stack stopped: {e}"),
-            },
-            res = &mut writer => break match res {
-                Ok(Err(e)) => format!("write error: {e}"),
-                Ok(Ok(())) => "writer finished".to_string(),
-                Err(e) => format!("writer task failed: {e}"),
-            },
+                    Some(Err(e)) => break format!("read error: {e}"),
+                    None => break "connection closed by guest".to_string(),
+                },
+                _ = ping.tick() => {
+                    if missed_pings >= MAX_MISSED_PINGS {
+                        break format!("keep-alive timeout ({MAX_MISSED_PINGS} pings unanswered)");
+                    }
+                    missed_pings += 1;
+                    if ctrl_tx.try_send(Frame::Ping(now_millis())).is_err() {
+                        tracing::debug!("control queue full, ping skipped");
+                    }
+                },
+                accepted = stack.accept() => match accepted {
+                    Ok(stream) => dispatch(shared, stream, &flows_cancel, &mut unknown_network),
+                    Err(e) => break format!("ip stack stopped: {e}"),
+                },
+                res = &mut writer => break match res {
+                    Ok(Err(e)) => format!("write error: {e}"),
+                    Ok(Ok(())) => "writer finished".to_string(),
+                    Err(e) => format!("writer task failed: {e}"),
+                },
+            }
         }
     };
 
@@ -469,8 +540,8 @@ fn handle_unknown_transport(shared: &Shared, u: ipstack::IpStackUnknownTransport
 
 /// Owns the sink half: merges control frames (priority) and stack packets,
 /// batching what is immediately available before each flush.
-async fn writer_loop<T: Transport>(
-    mut sink: SplitSink<FramedTransport<T>, Frame>,
+async fn writer_loop<S: FrameIo + 'static>(
+    mut sink: SplitSink<S, Frame>,
     mut ctrl: mpsc::Receiver<Frame>,
     mut packets: mpsc::Receiver<Bytes>,
     meter: Arc<RateMeter>,
@@ -541,6 +612,7 @@ mod tests {
             dns: Upstreams::fixed(vec!["127.0.0.1:53".parse().unwrap()], vec![]),
             active_flows: Arc::new(AtomicUsize::new(0)),
             next_flow_id: Default::default(),
+            active_guest: Default::default(),
         });
         (shared, rx)
     }
@@ -624,6 +696,88 @@ mod tests {
             .unwrap();
         assert_eq!(guest.next().await.unwrap().unwrap(), Frame::Bye);
         assert!(host.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_for_hello_ignores_noise_and_rejects_foreign_version() {
+        let (shared, _rx) = shared();
+        let (host_side, guest_side) = tokio::io::duplex(4096);
+        let mut guest = netm_proto::framed_sync(guest_side);
+        let cancel = CancellationToken::new();
+        let host = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            let cancel = cancel.clone();
+            async move {
+                let mut framed = netm_proto::framed_sync(host_side);
+                wait_for_hello(&mut framed, &shared, &cancel).await
+            }
+        });
+        // Leftovers from an earlier session are ignored...
+        guest.send(Frame::Ping(1)).await.unwrap();
+        guest
+            .send(Frame::IpPacket(Bytes::from_static(b"\x45junk")))
+            .await
+            .unwrap();
+        // ...a foreign version gets a Bye but the host keeps waiting...
+        guest
+            .send(Frame::Hello {
+                version: PROTOCOL_VERSION + 1,
+                name: "old".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(guest.next().await.unwrap().unwrap(), Frame::Bye);
+        // ...and a proper Hello completes the handshake.
+        guest
+            .send(Frame::Hello {
+                version: PROTOCOL_VERSION,
+                name: "serial-guest".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            guest.next().await.unwrap().unwrap(),
+            Frame::Hello { .. }
+        ));
+        assert_eq!(
+            guest.next().await.unwrap().unwrap(),
+            Frame::Config(TunnelConfig::default())
+        );
+        assert_eq!(host.await.unwrap(), Ok(Some("serial-guest".to_string())));
+    }
+
+    #[tokio::test]
+    async fn wait_for_hello_stops_on_cancel_and_on_close() {
+        let (shared, _rx) = shared();
+        let (host_side, guest_side) = tokio::io::duplex(4096);
+        let cancel = CancellationToken::new();
+        let mut framed = netm_proto::framed_sync(host_side);
+        cancel.cancel();
+        assert_eq!(
+            wait_for_hello(&mut framed, &shared, &cancel).await,
+            Ok(None)
+        );
+
+        let cancel = CancellationToken::new();
+        drop(guest_side);
+        let err = wait_for_hello(&mut framed, &shared, &cancel)
+            .await
+            .unwrap_err();
+        assert!(err.contains("closed"), "{err}");
+    }
+
+    #[test]
+    fn guest_slot_is_exclusive() {
+        let (shared, _rx) = shared();
+        let a = Endpoint::Serial("/dev/ttyA".into());
+        let b = Endpoint::Tcp("127.0.0.1:1".parse().unwrap());
+        assert!(shared.claim_guest(&a));
+        assert!(!shared.claim_guest(&b));
+        assert_eq!(shared.active_guest(), Some(a.clone()));
+        shared.release_guest(&b); // not the holder: no effect
+        assert_eq!(shared.active_guest(), Some(a.clone()));
+        shared.release_guest(&a);
+        assert!(shared.claim_guest(&b));
     }
 
     #[tokio::test]

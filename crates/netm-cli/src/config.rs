@@ -56,24 +56,45 @@ impl Mode {
 pub struct HostSettings {
     /// TCP data port the host listens on.
     pub port: u16,
+    /// Optional USB serial port served alongside TCP.
+    pub serial: Option<String>,
+    /// Serial line speed (USB CDC devices normally ignore this value).
+    pub baud: u32,
 }
 
 impl Default for HostSettings {
     fn default() -> Self {
         Self {
             port: netm_proto::DATA_PORT,
+            serial: None,
+            baud: netm_proto::transport::serial::DEFAULT_BAUD,
         }
     }
 }
 
 /// `[guest]` section.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuestSettings {
     /// Override for the DNS behaviour; `None` = decide from the route mode.
     pub set_dns: Option<bool>,
     /// IPv4 prefixes to route through the tunnel; empty = everything.
     pub routes: Vec<String>,
+    /// Optional USB serial port used instead of TCP discovery.
+    pub serial: Option<String>,
+    /// Serial line speed.
+    pub baud: u32,
+}
+
+impl Default for GuestSettings {
+    fn default() -> Self {
+        Self {
+            set_dns: None,
+            routes: Vec::new(),
+            serial: None,
+            baud: netm_proto::transport::serial::DEFAULT_BAUD,
+        }
+    }
 }
 
 /// The whole `config.toml`.
@@ -308,10 +329,16 @@ mod tests {
     fn toml_round_trip() {
         let cfg = Config {
             default_mode: Some(Mode::Guest),
-            host: HostSettings { port: 30000 },
+            host: HostSettings {
+                port: 30000,
+                serial: Some("/dev/tty.usbmodem-test".into()),
+                baud: 460_800,
+            },
             guest: GuestSettings {
                 set_dns: Some(false),
                 routes: vec!["1.1.1.1/32".into(), "8.8.8.0/24".into()],
+                serial: None,
+                baud: netm_proto::transport::serial::DEFAULT_BAUD,
             },
         };
         let text = cfg.to_toml().unwrap();

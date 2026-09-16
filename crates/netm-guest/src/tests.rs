@@ -11,7 +11,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use netm_proto::discovery::Discovered;
-use netm_proto::{framed, Frame, LinkInterface, LinkKind, TunnelConfig};
+use netm_proto::{
+    framed, framed_sync, Endpoint, Frame, FrameIo, LinkInterface, LinkKind, TunnelConfig,
+};
 use tokio::io::DuplexStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
@@ -74,6 +76,7 @@ struct FakeEnv {
     discovered: Option<Discovered>,
     neighbor: Option<SocketAddr>,
     links: Arc<Mutex<VecDeque<io::Result<DuplexStream>>>>,
+    serials: Arc<Mutex<VecDeque<io::Result<DuplexStream>>>>,
     tuns: Arc<Mutex<VecDeque<FakeTun>>>,
     cfg_log: Log,
     probes: Arc<Mutex<u32>>,
@@ -82,6 +85,7 @@ struct FakeEnv {
 impl GuestEnv for FakeEnv {
     type Tun = FakeTun;
     type Link = DuplexStream;
+    type Serial = DuplexStream;
 
     async fn list_interfaces(&mut self) -> io::Result<Vec<LinkInterface>> {
         Ok(self.ifaces.lock().unwrap().clone())
@@ -121,6 +125,16 @@ impl GuestEnv for FakeEnv {
             None => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "no more fake links",
+            )),
+        }
+    }
+
+    async fn open_serial(&mut self, _path: &str, _baud: u32) -> io::Result<DuplexStream> {
+        match self.serials.lock().unwrap().pop_front() {
+            Some(port) => port,
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no more fake serial ports",
             )),
         }
     }
@@ -171,10 +185,13 @@ struct FakeHost {
 /// Spawn a host that completes the handshake, echoes `IpPacket`s, answers
 /// `Ping` with `Pong`, and forwards injected frames.
 fn spawn_fake_host(stream: DuplexStream, config: TunnelConfig) -> FakeHost {
+    spawn_fake_host_framed(framed(stream), config)
+}
+
+fn spawn_fake_host_framed<S: FrameIo + 'static>(mut f: S, config: TunnelConfig) -> FakeHost {
     let (inject_tx, mut inject_rx) = mpsc::channel::<Frame>(16);
     let (seen_tx, seen_rx) = mpsc::channel::<Frame>(64);
     tokio::spawn(async move {
-        let mut f = framed(stream);
         let hello = f.next().await;
         let Some(Ok(Frame::Hello { version, name })) = hello else {
             panic!("expected Hello, got {hello:?}");
@@ -261,6 +278,7 @@ fn reconnect_backoff_doubles_and_caps() {
 struct Harness {
     ifaces: Arc<Mutex<Vec<LinkInterface>>>,
     links: Arc<Mutex<VecDeque<io::Result<DuplexStream>>>>,
+    serials: Arc<Mutex<VecDeque<io::Result<DuplexStream>>>>,
     tuns: Arc<Mutex<VecDeque<FakeTun>>>,
     cfg_log: Log,
     probes: Arc<Mutex<u32>>,
@@ -297,6 +315,7 @@ impl Harness {
     ) -> Harness {
         let ifaces = Arc::new(Mutex::new(ifaces));
         let links = Arc::new(Mutex::new(VecDeque::new()));
+        let serials = Arc::new(Mutex::new(VecDeque::new()));
         let tuns = Arc::new(Mutex::new(VecDeque::new()));
         let cfg_log: Log = Arc::default();
         let probes = Arc::new(Mutex::new(0));
@@ -305,6 +324,7 @@ impl Harness {
             discovered,
             neighbor,
             links: links.clone(),
+            serials: serials.clone(),
             tuns: tuns.clone(),
             cfg_log: cfg_log.clone(),
             probes: probes.clone(),
@@ -315,6 +335,7 @@ impl Harness {
         Harness {
             ifaces,
             links,
+            serials,
             tuns,
             cfg_log,
             probes,
@@ -329,6 +350,12 @@ impl Harness {
         let (tun, handle) = FakeTun::new(name);
         self.tuns.lock().unwrap().push_back(tun);
         handle
+    }
+
+    fn add_serial(&self, config: TunnelConfig) -> FakeHost {
+        let (guest, host) = tokio::io::duplex(64 * 1024);
+        self.serials.lock().unwrap().push_back(Ok(guest));
+        spawn_fake_host_framed(framed_sync(host), config)
     }
 
     async fn next_event(&mut self) -> GuestEvent {
@@ -449,7 +476,7 @@ async fn full_session_echo_ping_stats_and_host_bye() {
     assert_eq!(
         s,
         GuestState::Connecting {
-            host: host_addr().into()
+            host: Endpoint::Tcp(SocketAddr::from(host_addr()))
         }
     );
     let s = h
@@ -465,7 +492,7 @@ async fn full_session_echo_ping_stats_and_host_bye() {
     else {
         unreachable!()
     };
-    assert_eq!(connected_host, SocketAddr::from(host_addr()));
+    assert_eq!(connected_host, Endpoint::Tcp(SocketAddr::from(host_addr())));
     assert_eq!(host_name, "fakehost");
     assert_eq!(tun_name, "faketun0");
     assert_eq!(config, TunnelConfig::default());
@@ -590,7 +617,7 @@ async fn silent_multicast_falls_back_to_neighbour() {
         .wait_state(|s| matches!(s, GuestState::Connected { .. }))
         .await;
     assert!(
-        matches!(s, GuestState::Connected { host, .. } if host == neigh),
+        matches!(s, GuestState::Connected { ref host, .. } if host == &Endpoint::Tcp(neigh)),
         "{s:?}"
     );
     h.ctrl.send(GuestCommand::Shutdown).unwrap();
@@ -602,8 +629,12 @@ async fn no_host_answer_keeps_discovering() {
     let mut h = Harness::start(auto_cfg(true), vec![bridge_iface(true)], None);
     h.wait_state(|s| matches!(s, GuestState::Discovering { .. }))
         .await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert!(*h.probes.lock().unwrap() >= 2, "should keep probing");
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    let probes = *h.probes.lock().unwrap();
+    assert!(
+        (4..=6).contains(&probes),
+        "discovery should keep probing with capped exponential backoff, got {probes} attempts"
+    );
     assert!(h.cfg_log().is_empty());
     h.ctrl.send(GuestCommand::Shutdown).unwrap();
     h.finish().await.unwrap();
@@ -672,7 +703,12 @@ async fn manual_target_with_custom_routes_and_no_dns() {
     let s = h
         .wait_state(|s| matches!(s, GuestState::Connecting { .. }))
         .await;
-    assert_eq!(s, GuestState::Connecting { host: addr });
+    assert_eq!(
+        s,
+        GuestState::Connecting {
+            host: Endpoint::Tcp(addr)
+        }
+    );
     h.wait_state(|s| matches!(s, GuestState::Connected { .. }))
         .await;
     assert_eq!(*h.probes.lock().unwrap(), 0, "manual target must not probe");
@@ -724,7 +760,7 @@ async fn manual_target_waits_for_the_cable_instead_of_dialling() {
     let s = h
         .wait_state(|s| matches!(s, GuestState::Connected { .. }))
         .await;
-    assert!(matches!(s, GuestState::Connected { host, .. } if host == addr));
+    assert!(matches!(s, GuestState::Connected { host, .. } if host == Endpoint::Tcp(addr)));
     h.ctrl.send(GuestCommand::Shutdown).unwrap();
     h.finish().await.unwrap();
 }
@@ -751,6 +787,51 @@ async fn connect_failure_without_reconnect_returns_error() {
     assert!(saw_error);
     let err = h.finish().await.unwrap_err();
     assert!(err.to_string().contains("connecting"), "{err}");
+}
+
+#[tokio::test]
+async fn serial_target_uses_sync_framing_and_skips_network_discovery() {
+    let path = "/dev/tty.usbmodem-netm-test";
+    let cfg = GuestConfig {
+        name: "serial-guest".into(),
+        host: HostTarget::Serial {
+            path: path.into(),
+            baud: 921_600,
+        },
+        routes: RouteMode::Full,
+        set_dns: true,
+        reconnect: false,
+    };
+    let mut h = Harness::start(cfg, Vec::new(), None);
+    let tun = h.add_tun("faketun-serial");
+    let mut host = h.add_serial(TunnelConfig::default());
+
+    let state = h
+        .wait_state(|s| matches!(s, GuestState::Discovering { .. }))
+        .await;
+    assert_eq!(state, GuestState::Discovering { iface: path.into() });
+    let state = h
+        .wait_state(|s| matches!(s, GuestState::Connected { .. }))
+        .await;
+    assert!(matches!(
+        state,
+        GuestState::Connected {
+            host: Endpoint::Serial(ref p),
+            ref tun,
+            ..
+        } if p == path && tun == "faketun-serial"
+    ));
+    assert_eq!(*h.probes.lock().unwrap(), 0);
+
+    let packet = vec![0x45, 0, 0, 4];
+    tun.inject.send(packet.clone()).await.unwrap();
+    assert_eq!(
+        expect_seen(&mut host, |f| matches!(f, Frame::IpPacket(_))).await,
+        Frame::IpPacket(Bytes::from(packet))
+    );
+
+    h.ctrl.send(GuestCommand::Shutdown).unwrap();
+    h.finish().await.unwrap();
 }
 
 #[tokio::test]

@@ -374,6 +374,9 @@ pub fn guest_summary(cfg: &netm_guest::GuestConfig) -> Vec<(String, String)> {
     let host = match &cfg.host {
         netm_guest::HostTarget::Auto => "自动发现".to_string(),
         netm_guest::HostTarget::Manual(a) => a.to_string(),
+        netm_guest::HostTarget::Serial { path, baud } => {
+            format!("串口 {path}（{baud} baud）")
+        }
     };
     vec![
         ("路由".into(), routes),

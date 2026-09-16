@@ -310,7 +310,10 @@ async fn benchmark_udp_round_trip_latency() {
     let p99 = samples_us[((samples_us.len() - 1) as f64 * 0.99) as usize];
     println!("full host UDP path RTT: p50 {p50:.1} us, p99 {p99:.1} us");
     if !cfg!(debug_assertions) {
-        assert!(p99 < 1_000.0, "release p99 latency exceeded 1 ms: {p99:.1} us");
+        assert!(
+            p99 < 1_000.0,
+            "release p99 latency exceeded 1 ms: {p99:.1} us"
+        );
     }
 
     guest.send(Frame::Bye).await.unwrap();

@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use futures::{FutureExt, SinkExt, StreamExt};
 use netm_proto::{
-    framed, Frame, FramedTransport, LinkInterface, RateMeter, Transport, TunnelConfig,
+    framed, framed_sync, Endpoint, Frame, FrameIo, LinkInterface, RateMeter, TunnelConfig,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
@@ -91,11 +91,17 @@ pub(crate) struct Shutdown;
 
 /// Where to connect, produced by the discovery phase.
 #[derive(Clone, Debug)]
-struct Target {
-    addr: SocketAddr,
-    host_name: Option<String>,
-    /// Interface whose link-local presence is watched while connected.
-    link_iface: Option<String>,
+enum Target {
+    Tcp {
+        addr: SocketAddr,
+        host_name: Option<String>,
+        /// Interface whose link-local presence is watched while connected.
+        link_iface: Option<String>,
+    },
+    Serial {
+        path: String,
+        baud: u32,
+    },
 }
 
 /// How a connection attempt / session ended.
@@ -163,8 +169,8 @@ fn iface_for_addr(addr: &SocketAddr, ifaces: &[LinkInterface]) -> Option<String>
     }
 }
 
-async fn send_frame<T: Transport>(
-    framed: &mut FramedTransport<T>,
+async fn send_frame<S: FrameIo>(
+    framed: &mut S,
     frame: Frame,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -175,8 +181,8 @@ async fn send_frame<T: Transport>(
     }
 }
 
-async fn feed_frame<T: Transport>(
-    framed: &mut FramedTransport<T>,
+async fn feed_frame<S: FrameIo>(
+    framed: &mut S,
     frame: Frame,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -188,8 +194,8 @@ async fn feed_frame<T: Transport>(
 }
 
 /// Guest side of the handshake: `Hello` → expect `Hello` then `Config`.
-pub(crate) async fn handshake<T: Transport>(
-    framed: &mut FramedTransport<T>,
+pub(crate) async fn handshake<S: FrameIo>(
+    framed: &mut S,
     name: &str,
     timeout: Duration,
 ) -> Result<(String, TunnelConfig)> {
@@ -361,15 +367,34 @@ impl<E: GuestEnv> Guest<E> {
     pub(crate) async fn run(mut self) -> Result<()> {
         self.report_local_egress().await;
         let mut failure_backoff = self.timings.retry_backoff;
+        let mut discovery_backoff = self.timings.retry_backoff;
         loop {
             if self.shutdown_requested() {
                 break;
             }
             let target = match self.find_target().await {
                 Ok(Some(t)) => t,
-                Ok(None) => continue,
+                Ok(None) => {
+                    let waiting_for_host = matches!(self.state, GuestState::Discovering { .. });
+                    let delay = if waiting_for_host {
+                        let delay = discovery_backoff;
+                        discovery_backoff = next_retry_backoff(
+                            discovery_backoff,
+                            self.timings.max_retry_backoff,
+                        );
+                        delay
+                    } else {
+                        discovery_backoff = self.timings.retry_backoff;
+                        self.timings.retry_backoff
+                    };
+                    if self.sleep(delay).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 Err(Shutdown) => break,
             };
+            discovery_backoff = self.timings.retry_backoff;
             let retry_delay = match self.serve(target).await {
                 Outcome::Shutdown => break,
                 Outcome::Lost(reason) => {
@@ -419,9 +444,16 @@ impl<E: GuestEnv> Guest<E> {
     /// Discovery phase. `Ok(None)` = nothing found this round (already
     /// slept); `Ok(Some)` = connect to this target.
     async fn find_target(&mut self) -> Result<Option<Target>, Shutdown> {
-        let ifaces = self.refresh_interfaces().await;
         match self.cfg.host.clone() {
+            HostTarget::Serial { path, baud } => {
+                self.set_state(GuestState::Discovering {
+                    iface: path.clone(),
+                })
+                .await;
+                Ok(Some(Target::Serial { path, baud }))
+            }
             HostTarget::Manual(addr) => {
+                let ifaces = self.refresh_interfaces().await;
                 let link_iface = iface_for_addr(&addr, &ifaces);
                 // A link-local target is unreachable until its interface has
                 // a carrier; retrying regardless just fills the log with
@@ -429,22 +461,21 @@ impl<E: GuestEnv> Guest<E> {
                 if let Some(name) = link_iface.as_deref() {
                     if self.env.link_active(name) == Some(false) {
                         self.set_state(GuestState::WaitingForLink).await;
-                        self.sleep(self.timings.retry_backoff).await?;
                         return Ok(None);
                     }
                 }
-                Ok(Some(Target {
+                Ok(Some(Target::Tcp {
                     addr,
                     host_name: None,
                     link_iface,
                 }))
             }
             HostTarget::Auto => {
+                let ifaces = self.refresh_interfaces().await;
                 let ready: Vec<LinkInterface> =
                     ifaces.into_iter().filter(|i| i.is_ready()).collect();
                 if ready.is_empty() {
                     self.set_state(GuestState::WaitingForLink).await;
-                    self.sleep(self.timings.retry_backoff).await?;
                     return Ok(None);
                 }
                 for iface in ready {
@@ -460,7 +491,7 @@ impl<E: GuestEnv> Guest<E> {
                                 d.host_name, d.host_addr, iface.name
                             ))
                             .await;
-                            return Ok(Some(Target {
+                            return Ok(Some(Target::Tcp {
                                 addr: d.host_addr.into(),
                                 host_name: Some(d.host_name),
                                 link_iface: Some(iface.name),
@@ -474,7 +505,7 @@ impl<E: GuestEnv> Guest<E> {
                                     iface.name
                                 ))
                                 .await;
-                                return Ok(Some(Target {
+                                return Ok(Some(Target::Tcp {
                                     addr,
                                     host_name: None,
                                     link_iface: Some(iface.name),
@@ -486,7 +517,6 @@ impl<E: GuestEnv> Guest<E> {
                         }
                     }
                 }
-                self.sleep(self.timings.retry_backoff).await?;
                 Ok(None)
             }
         }
@@ -495,21 +525,59 @@ impl<E: GuestEnv> Guest<E> {
     /// Connect, handshake, bring the tunnel up, pump until it ends, tear
     /// everything down.
     async fn serve(&mut self, target: Target) -> Outcome {
-        let addr = target.addr;
-        self.set_state(GuestState::Connecting { host: addr }).await;
+        match target {
+            Target::Tcp {
+                addr,
+                host_name,
+                link_iface,
+            } => {
+                let endpoint = Endpoint::Tcp(addr);
+                self.set_state(GuestState::Connecting {
+                    host: endpoint.clone(),
+                })
+                .await;
+                let link = match ctrl_aware(
+                    &mut self.ctrl,
+                    self.env.connect(addr, self.timings.connect_timeout),
+                )
+                .await
+                {
+                    Err(Shutdown) => return Outcome::Shutdown,
+                    Ok(Err(e)) => return Outcome::Failed(anyhow!("connecting to {addr}: {e}")),
+                    Ok(Ok(link)) => link,
+                };
+                self.serve_framed(framed(link), endpoint, host_name, link_iface)
+                    .await
+            }
+            Target::Serial { path, baud } => {
+                let endpoint = Endpoint::Serial(path.clone());
+                self.set_state(GuestState::Connecting {
+                    host: endpoint.clone(),
+                })
+                .await;
+                let port = match ctrl_aware(&mut self.ctrl, self.env.open_serial(&path, baud)).await
+                {
+                    Err(Shutdown) => return Outcome::Shutdown,
+                    Ok(Err(e)) => {
+                        return Outcome::Failed(anyhow!(
+                            "opening serial port {path} at {baud} baud: {e}"
+                        ))
+                    }
+                    Ok(Ok(port)) => port,
+                };
+                self.serve_framed(framed_sync(port), endpoint, None, None)
+                    .await
+            }
+        }
+    }
 
-        let link = match ctrl_aware(
-            &mut self.ctrl,
-            self.env.connect(addr, self.timings.connect_timeout),
-        )
-        .await
-        {
-            Err(Shutdown) => return Outcome::Shutdown,
-            Ok(Err(e)) => return Outcome::Failed(anyhow!("connecting to {addr}: {e}")),
-            Ok(Ok(l)) => l,
-        };
-        let mut framed = framed(link);
-
+    async fn serve_framed<S: FrameIo>(
+        &mut self,
+        mut framed: S,
+        endpoint: Endpoint,
+        discovered_name: Option<String>,
+        link_iface: Option<String>,
+    ) -> Outcome {
         let (host_name, tcfg) = match ctrl_aware(
             &mut self.ctrl,
             handshake(&mut framed, &self.cfg.name, self.timings.handshake_timeout),
@@ -523,7 +591,7 @@ impl<E: GuestEnv> Guest<E> {
             Ok(Err(e)) => return Outcome::Failed(e.context("handshake")),
             Ok(Ok(v)) => v,
         };
-        let host_name = target.host_name.clone().unwrap_or(host_name);
+        let host_name = discovered_name.unwrap_or(host_name);
         self.log(format!(
             "handshake with {host_name} ok: {}/{} via {} dns {} mtu {}",
             tcfg.guest_ip, tcfg.prefix_len, tcfg.gateway_ip, tcfg.dns, tcfg.mtu
@@ -597,7 +665,7 @@ impl<E: GuestEnv> Guest<E> {
         .await;
 
         self.set_state(GuestState::Connected {
-            host: addr,
+            host: endpoint,
             host_name,
             tun: tun_name.clone(),
             config: tcfg.clone(),
@@ -607,7 +675,7 @@ impl<E: GuestEnv> Guest<E> {
 
         let meter = RateMeter::default();
         let end = self
-            .pump(&mut framed, &tun, &meter, target.link_iface.as_deref())
+            .pump(&mut framed, &tun, &meter, link_iface.as_deref())
             .await;
 
         // Teardown, in reverse order of setup.
@@ -638,9 +706,9 @@ impl<E: GuestEnv> Guest<E> {
     }
 
     /// Packet pump: TUN ⇄ frames, keep-alives, stats, link watch.
-    async fn pump<T: Transport, U: TunIo>(
+    async fn pump<S: FrameIo, U: TunIo>(
         &mut self,
-        framed: &mut FramedTransport<T>,
+        framed: &mut S,
         tun: &U,
         meter: &RateMeter,
         link_iface: Option<&str>,

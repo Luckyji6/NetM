@@ -21,9 +21,13 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Platform support: macOS is the primary target (utun, `route`, `scutil`).
-//! Linux (`ip` / `resolvectl`) and Windows (Wintun / `netsh` / `route`) are
-//! implemented but have not been run on real machines yet.
+//! Platform support: macOS (utun via tun-rs, `route`/`scutil`) is verified
+//! on real hardware. Linux (`ip`/`resolvectl`) and Windows (Wintun,
+//! `netsh`/`route`) are implemented and compile-checked but have not yet
+//! been exercised on real machines.
+//!
+//! Transports: TCP over a Thunderbolt/USB4 bridge (with multicast discovery
+//! or a manual address) and a USB serial port ([`HostTarget::Serial`]).
 
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -36,6 +40,7 @@ mod guest;
 pub mod platform;
 pub mod tun;
 
+pub use netm_proto::Endpoint;
 pub use platform::PlatformConfigurator;
 
 /// Which traffic is sent through the tunnel.
@@ -67,6 +72,27 @@ pub enum HostTarget {
     /// Connect to this address directly. For a link-local IPv6 address the
     /// `scope_id` must be set to the interface index.
     Manual(SocketAddr),
+    /// Talk to the host over a USB serial port instead of a network link.
+    /// No link watching or discovery: the port is opened (retrying every
+    /// 2 s while it is absent, reported as
+    /// [`GuestState::Discovering`] with `iface = path`), `Hello` is sent and
+    /// re-sent every handshake timeout until the host answers.
+    Serial {
+        /// Device path (`/dev/tty.usbmodem1234`, `/dev/ttyACM0`, `COM5`).
+        path: String,
+        /// Line speed; see [`netm_proto::transport::serial::DEFAULT_BAUD`].
+        baud: u32,
+    },
+}
+
+impl HostTarget {
+    /// Serial target at the default baud rate.
+    pub fn serial(path: impl Into<String>) -> Self {
+        HostTarget::Serial {
+            path: path.into(),
+            baud: netm_proto::transport::serial::DEFAULT_BAUD,
+        }
+    }
 }
 
 /// Guest configuration.
@@ -109,15 +135,14 @@ fn default_name() -> String {
 pub enum GuestState {
     /// No candidate interface has a link-local address yet (cable unplugged).
     WaitingForLink,
-    /// A link is present; probing it for a host.
-    Discovering {
-        iface: String,
-    },
-    Connecting {
-        host: SocketAddr,
-    },
+    /// A link is present; probing it for a host. For
+    /// [`HostTarget::Serial`]: waiting for the port `iface` to appear.
+    Discovering { iface: String },
+    /// Connecting to the host (TCP) or sending `Hello` and waiting for the
+    /// host's answer (serial).
+    Connecting { host: Endpoint },
     Connected {
-        host: SocketAddr,
+        host: Endpoint,
         host_name: String,
         /// OS name of the TUN interface (`utun4`).
         tun: String,
@@ -126,9 +151,7 @@ pub enum GuestState {
     },
     /// Transient; followed by [`GuestState::WaitingForLink`] when
     /// `reconnect` is on.
-    Disconnected {
-        reason: String,
-    },
+    Disconnected { reason: String },
 }
 
 /// Events reported by [`run`].
@@ -151,7 +174,7 @@ pub enum GuestEvent {
     /// startup and after every teardown; `None` when it cannot be
     /// determined.
     LocalEgress(Option<String>),
-    /// One-shot Type-C / Thunderbolt link-capacity probe (not Internet).
+    /// One-shot tunnel transport capacity probe (not Internet speed).
     LinkSpeed(netm_proto::LinkSpeed),
     Log(String),
     Error(String),
@@ -167,8 +190,11 @@ pub enum GuestCommand {
 }
 
 /// Whether the guest needs root/administrator privileges on this OS.
+///
+/// Always `true`: creating the TUN device and changing routes needs root on
+/// Unix and an elevated (administrator) process on Windows.
 pub fn requires_root() -> bool {
-    cfg!(unix) || cfg!(windows)
+    true
 }
 
 /// Run the guest until [`GuestCommand::Shutdown`] is received (or, with
@@ -184,8 +210,8 @@ pub async fn run(
 ) -> Result<()> {
     if requires_root() && !netm_proto::privilege::is_root() {
         bail!(
-            "netm guest needs root privileges to create the TUN device and change routes; \
-             re-run with `sudo`"
+            "netm guest needs root/administrator privileges to create the TUN device and \
+             change routes; re-run with `sudo` (or from an elevated prompt on Windows)"
         );
     }
     guest::Guest::new(cfg, env::RealEnv, events, ctrl, guest::Timings::default())

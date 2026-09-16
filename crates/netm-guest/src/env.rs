@@ -16,6 +16,7 @@ use crate::tun::TunIo;
 pub(crate) trait GuestEnv: Send + 'static {
     type Tun: TunIo;
     type Link: Transport;
+    type Serial: Transport;
 
     /// Candidate link interfaces, sorted by preference.
     fn list_interfaces(&mut self) -> impl Future<Output = io::Result<Vec<LinkInterface>>> + Send;
@@ -53,6 +54,13 @@ pub(crate) trait GuestEnv: Send + 'static {
         timeout: Duration,
     ) -> impl Future<Output = io::Result<Self::Link>> + Send;
 
+    /// Open the serial port `path` at `baud` (raw byte stream to the host).
+    fn open_serial(
+        &mut self,
+        path: &str,
+        baud: u32,
+    ) -> impl Future<Output = io::Result<Self::Serial>> + Send;
+
     /// Create the TUN interface for `cfg`.
     fn open_tun(
         &mut self,
@@ -63,12 +71,13 @@ pub(crate) trait GuestEnv: Send + 'static {
     fn configurator(&mut self) -> Box<dyn PlatformConfigurator>;
 }
 
-/// Production environment: real interfaces, discovery, TCP and tun-rs.
+/// Production environment: real interfaces, discovery, TCP, serial and tun-rs.
 pub(crate) struct RealEnv;
 
 impl GuestEnv for RealEnv {
     type Tun = crate::tun::TunDevice;
     type Link = tokio::net::TcpStream;
+    type Serial = netm_proto::transport::serial::SerialStream;
 
     async fn list_interfaces(&mut self) -> io::Result<Vec<LinkInterface>> {
         // `networksetup` is spawned under the hood on macOS: keep it off the
@@ -111,6 +120,14 @@ impl GuestEnv for RealEnv {
         timeout: Duration,
     ) -> io::Result<tokio::net::TcpStream> {
         netm_proto::transport::tcp::connect(addr, timeout).await
+    }
+
+    async fn open_serial(
+        &mut self,
+        path: &str,
+        baud: u32,
+    ) -> io::Result<netm_proto::transport::serial::SerialStream> {
+        netm_proto::transport::serial::open(path, baud).await
     }
 
     async fn open_tun(&mut self, cfg: &TunnelConfig) -> io::Result<crate::tun::TunDevice> {

@@ -18,8 +18,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::time::timeout;
 
-use crate::frame::{Frame, FrameError, FramedTransport, MAX_FRAME_SIZE};
-use crate::transport::Transport;
+use crate::frame::{Frame, FrameError, FrameIo, MAX_FRAME_SIZE};
 
 /// Tunables of one burst. Production values fill the pipe for a fraction of
 /// a second; tests use [`Params::for_tests`].
@@ -164,10 +163,7 @@ fn kind(f: &Frame) -> &'static str {
     }
 }
 
-async fn send_burst<T: Transport>(
-    framed: &mut FramedTransport<T>,
-    params: Params,
-) -> Result<u64, Error> {
+async fn send_burst<S: FrameIo>(framed: &mut S, params: Params) -> Result<u64, Error> {
     validate(params)?;
     let full_payload = Bytes::from(vec![0u8; params.chunk]);
     let start = Instant::now();
@@ -197,10 +193,7 @@ async fn send_burst<T: Transport>(
     Ok(sent)
 }
 
-async fn next_frame<T: Transport>(
-    framed: &mut FramedTransport<T>,
-    wait: Duration,
-) -> Result<Frame, Error> {
+async fn next_frame<S: FrameIo>(framed: &mut S, wait: Duration) -> Result<Frame, Error> {
     match timeout(wait, framed.next()).await {
         Err(_) => Err(Error::Timeout),
         Ok(None) => Err(Error::Closed),
@@ -211,8 +204,8 @@ async fn next_frame<T: Transport>(
 }
 
 /// Receive a burst. `first` is a [`Frame::SpeedChunk`] already read, if any.
-async fn recv_burst<T: Transport>(
-    framed: &mut FramedTransport<T>,
+async fn recv_burst<S: FrameIo>(
+    framed: &mut S,
     first: Option<Bytes>,
     params: Params,
 ) -> Result<(u64, u64), Error> {
@@ -260,8 +253,8 @@ async fn recv_burst<T: Transport>(
 }
 
 /// Guest side: push a burst, read the host's, return both rates.
-pub async fn run_as_initiator<T: Transport>(
-    framed: &mut FramedTransport<T>,
+pub async fn run_as_initiator<S: FrameIo>(
+    framed: &mut S,
     params: Params,
 ) -> Result<LinkSpeed, Error> {
     validate(params)?;
@@ -305,8 +298,8 @@ pub enum ResponderOutcome {
 /// Host side: wait briefly for the guest to start. [`ResponderOutcome::Skipped`]
 /// means carry on with the tunnel (old guest, or the guest sent traffic
 /// first).
-pub async fn run_as_responder<T: Transport>(
-    framed: &mut FramedTransport<T>,
+pub async fn run_as_responder<S: FrameIo>(
+    framed: &mut S,
     params: Params,
 ) -> Result<ResponderOutcome, Error> {
     validate(params)?;
