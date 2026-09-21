@@ -8,6 +8,7 @@ use ratatui::widgets::{
     Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Sparkline, Table, Wrap,
 };
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{App, Screen};
 use super::model::{
@@ -174,7 +175,7 @@ fn render_guest(app: &App, m: &GuestModel, frame: &mut Frame, area: Rect) {
     let [status, banner, middle, thr, log] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(if warning.is_some() { 3 } else { 0 }),
-        Constraint::Length(9),
+        Constraint::Length(12),
         Constraint::Length(4),
         Constraint::Min(4),
     ])
@@ -185,17 +186,18 @@ fn render_guest(app: &App, m: &GuestModel, frame: &mut Frame, area: Rect) {
         render_egress_warning(&text, frame, banner);
     }
 
-    let [ifaces, conn] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(middle);
-    render_interfaces(&m.interfaces, "链路网卡", "线缆", frame, ifaces);
-    render_guest_connection(app, m, frame, conn);
-    render_throughput(
-        &m.throughput,
-        "上行（客机 → 宿主机）",
-        "下行（宿主机 → 客机）",
-        frame,
-        thr,
-    );
+    if middle.width >= 92 {
+        let [ifaces, conn] =
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(middle);
+        render_interfaces(&m.interfaces, "链路网卡", "线缆", frame, ifaces);
+        render_guest_connection(app, m, frame, conn);
+    } else {
+        // Two half-width panels become unreadable on narrow terminals. The
+        // connection is the important live state; interface details remain
+        // available in the status line and log.
+        render_guest_connection(app, m, frame, middle);
+    }
+    render_throughput(&m.throughput, "客机 → 宿主机", "宿主机 → 客机", frame, thr);
     render_log(&app.log, app.log_focus, app.log_path.as_deref(), frame, log);
 }
 
@@ -312,19 +314,78 @@ fn render_interfaces(
     frame.render_widget(table, area);
 }
 
-fn kv_lines<'a>(pairs: &[(String, String)]) -> Vec<Line<'a>> {
-    let width = pairs
+fn truncate_end(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".into();
+    }
+    let content_width = max_width - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in value.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > content_width {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    out.push('…');
+    out
+}
+
+fn truncate_start(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".into();
+    }
+    let content_width = max_width - 1;
+    let mut suffix = Vec::new();
+    let mut used = 0;
+    for ch in value.chars().rev() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > content_width {
+            break;
+        }
+        suffix.push(ch);
+        used += width;
+    }
+    suffix.reverse();
+    format!("…{}", suffix.into_iter().collect::<String>())
+}
+
+fn pad_right(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn kv_lines<'a>(pairs: &[(String, String)], content_width: usize) -> Vec<Line<'a>> {
+    let label_width = pairs
         .iter()
-        .map(|(k, _)| k.chars().count())
+        .map(|(key, _)| UnicodeWidthStr::width(key.as_str()))
         .max()
         .unwrap_or(0);
+    let prefix_width = label_width.saturating_add(2);
+    let value_width = content_width.saturating_sub(prefix_width);
     pairs
         .iter()
-        .map(|(k, v)| {
-            let pad = width - k.chars().count();
+        .map(|(key, value)| {
             Line::from(vec![
-                Span::styled(format!(" {}{} ", k, "　".repeat(pad)), Style::new().fg(DIM)),
-                Span::raw(v.clone()),
+                Span::styled(
+                    format!(" {} ", pad_right(key, label_width)),
+                    Style::new().fg(DIM),
+                ),
+                Span::raw(truncate_end(value, value_width)),
             ])
         })
         .collect()
@@ -340,7 +401,8 @@ fn render_guest_connection(app: &App, m: &GuestModel, frame: &mut Frame, area: R
             config,
             since,
         } => {
-            pairs.push(("宿主机".into(), format!("{host_name}  {host}")));
+            pairs.push(("宿主机".into(), host_name.clone()));
+            pairs.push(("对端".into(), host.to_string()));
             pairs.push(("TUN".into(), tun.clone()));
             pairs.push((
                 "虚拟 IP".into(),
@@ -377,8 +439,9 @@ fn render_guest_connection(app: &App, m: &GuestModel, frame: &mut Frame, area: R
     let block = Block::bordered()
         .title(" 连接信息 ")
         .border_style(Style::new().fg(DIM));
+    let content_width = block.inner(area).width as usize;
     frame.render_widget(
-        Paragraph::new(Text::from(kv_lines(&pairs))).block(block),
+        Paragraph::new(Text::from(kv_lines(&pairs, content_width))).block(block),
         area,
     );
 }
@@ -401,17 +464,15 @@ fn render_host(app: &App, m: &HostModel, frame: &mut Frame, area: Rect) {
     .areas(inner);
 
     render_host_header(app, m, frame, header);
-    let [guest, flows] =
-        Layout::horizontal([Constraint::Length(44), Constraint::Fill(1)]).areas(middle);
-    render_host_guest(m, frame, guest);
-    render_flows(m, frame, flows);
-    render_throughput(
-        &m.throughput,
-        "下发（宿主机 → 客机）",
-        "上收（客机 → 宿主机）",
-        frame,
-        thr,
-    );
+    if middle.width >= 90 {
+        let [guest, flows] =
+            Layout::horizontal([Constraint::Length(44), Constraint::Fill(1)]).areas(middle);
+        render_host_guest(m, frame, guest);
+        render_flows(m, frame, flows);
+    } else {
+        render_host_guest(m, frame, middle);
+    }
+    render_throughput(&m.throughput, "宿主机 → 客机", "客机 → 宿主机", frame, thr);
     render_log(&app.log, app.log_focus, app.log_path.as_deref(), frame, log);
 }
 
@@ -517,10 +578,9 @@ fn render_host_guest(m: &HostModel, frame: &mut Frame, area: Rect) {
     let block = Block::bordered()
         .title(" 客机 ")
         .border_style(Style::new().fg(color));
+    let content_width = block.inner(area).width as usize;
     frame.render_widget(
-        Paragraph::new(Text::from(kv_lines(&pairs)))
-            .wrap(Wrap { trim: false })
-            .block(block),
+        Paragraph::new(Text::from(kv_lines(&pairs, content_width))).block(block),
         area,
     );
 }
@@ -611,8 +671,9 @@ fn render_rate(
     frame: &mut Frame,
     area: Rect,
 ) {
+    let text_width = if area.width >= 42 { 32 } else { area.width };
     let [text, spark] =
-        Layout::horizontal([Constraint::Length(34), Constraint::Fill(1)]).areas(area);
+        Layout::horizontal([Constraint::Length(text_width), Constraint::Fill(1)]).areas(area);
     let lines = vec![
         Line::from(vec![
             Span::styled(format!(" {arrow} "), Style::new().fg(ACCENT).bold()),
@@ -620,7 +681,7 @@ fn render_rate(
         ]),
         Line::from(vec![
             Span::styled(format!("   {label} "), Style::new().fg(DIM)),
-            Span::styled(format!("累计 {}", fmt_bytes(total)), Style::new().fg(DIM)),
+            Span::styled(format!("· {}", fmt_bytes(total)), Style::new().fg(DIM)),
         ]),
     ];
     frame.render_widget(Paragraph::new(Text::from(lines)), text);
@@ -645,12 +706,16 @@ fn render_log(
     if focused {
         title.push_str(&format!("[滚动 ↑{}] ", log.scroll_up()));
     }
+    let available_path_width = area.width.saturating_sub(6) as usize;
     let block = Block::bordered()
         .title(title)
         .title_bottom(
             path.map(|p| {
                 Line::from(Span::styled(
-                    format!(" {} ", p.display()),
+                    format!(
+                        " {} ",
+                        truncate_start(&p.display().to_string(), available_path_width)
+                    ),
                     Style::new().fg(DIM),
                 ))
                 .right_aligned()
@@ -678,7 +743,7 @@ fn render_log(
 }
 
 fn render_help(app: &App, frame: &mut Frame, area: Rect) {
-    let popup = area.centered(Constraint::Length(56), Constraint::Length(14));
+    let popup = area.centered(Constraint::Max(56), Constraint::Max(14));
     frame.render_widget(Clear, popup);
     let keys: &[(&str, &str)] = match app.screen {
         Screen::Onboarding { .. } => &[
@@ -697,7 +762,10 @@ fn render_help(app: &App, frame: &mut Frame, area: Rect) {
         .iter()
         .map(|(k, d)| {
             Line::from(vec![
-                Span::styled(format!(" {k:<12}"), Style::new().fg(ACCENT).bold()),
+                Span::styled(
+                    format!(" {}", pad_right(k, 12)),
+                    Style::new().fg(ACCENT).bold(),
+                ),
                 Span::raw(*d),
             ])
         })
@@ -736,7 +804,7 @@ mod tests {
     use crate::session::Level;
     use crate::tui::model::{GuestModel, HostModel};
     use netm_host::{FlowInfo, GuestInfo, Proto};
-    use netm_proto::{LinkInterface, LinkKind};
+    use netm_proto::{LinkInterface, LinkKind, LinkSpeed};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::time::Instant;
@@ -821,23 +889,55 @@ mod tests {
         if let Screen::Guest(m) = &mut a.screen {
             m.state = GuestState::Connected {
                 host: netm_proto::Endpoint::Tcp("[fe80::1%20]:27778".parse().unwrap()),
-                host_name: "mac-host".into(),
+                host_name: "LuckyJideMac-mini.local".into(),
                 tun: "utun4".into(),
                 config: Default::default(),
                 since: Instant::now(),
             };
+            m.link_speed = Some(LinkSpeed {
+                up_bps: 15.55e9,
+                down_bps: 14.44e9,
+                up_bytes: 16 * 1024 * 1024,
+                down_bytes: 16 * 1024 * 1024,
+            });
             m.throughput
                 .push(Default::default(), 1_500_000.0, 3_000_000.0);
         }
+        let s = draw(&a, 118, 30);
+        assert!(has(&s, "LuckyJideMac-mini.local"));
+        assert!(has(&s, "15.55 Gbit/s"));
+        assert!(has(&s, "14.44 Gbit/s"));
+        assert!(has(&s, "[fe80::1%20]:27778"));
+        // The narrow layout gives connection details the full row instead of
+        // rendering two unusable half-width panels.
+        let narrow = draw(&a, 80, 30);
+        assert!(has(&narrow, "LuckyJideMac-mini.local"));
+        assert!(has(&narrow, "15.55 Gbit/s"));
+
         a.show_help = true;
         let s = draw(&a, 120, 40);
         assert!(has(&s, "已连接"));
-        assert!(has(&s, "mac-host"));
+        assert!(has(&s, "LuckyJideMac-mini.local"));
         assert!(has(&s, "utun4"));
         assert!(has(&s, "10.77.0.2/24"));
         assert!(has(&s, "1.50 Mbit/s"));
         assert!(has(&s, "帮助"));
         let _ = draw(&a, 30, 8);
+    }
+
+    #[test]
+    fn key_value_rows_use_terminal_width_not_character_count() {
+        let pairs = vec![
+            ("TUN".into(), "utun15".into()),
+            ("宿主机".into(), "LuckyJideMac-mini.local".into()),
+            ("网关 / DNS".into(), "10.77.0.1 / 10.77.0.1".into()),
+        ];
+        let lines = kv_lines(&pairs, 32);
+        let label_widths: Vec<_> = lines.iter().map(|line| line.spans[0].width()).collect();
+        assert!(label_widths.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(lines.iter().all(|line| !line.to_string().contains('　')));
+        assert_eq!(truncate_end("LuckyJideMac-mini.local", 10), "LuckyJide…");
+        assert_eq!(truncate_start("/very/long/path/netm.log", 10), "…/netm.log");
     }
 
     #[test]

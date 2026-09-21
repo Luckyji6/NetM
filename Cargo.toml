@@ -6,7 +6,7 @@ resolver = "2"
 edition = "2021"
 version = "0.3.0"
 license = "MIT"
-repository = ""
+repository = "https://github.com/Luckyji6/NetM"
 authors = ["Luckyji6 <lucky123456jx@qq.com>"]
 
 [profile.release]
@@ -29,6 +29,7 @@ bytes = "1.12"
 futures = "0.3"
 thiserror = "2.0"
 tracing = "0.1"
+unicode-width = "0.2"
 
 # Serialization (control payloads use postcard)
 serde = { version = "1.0", features = ["derive"] }

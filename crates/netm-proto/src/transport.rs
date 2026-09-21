@@ -92,8 +92,11 @@ pub mod serial {
             .data_bits(DataBits::Eight)
             .parity(Parity::None)
             .stop_bits(StopBits::One)
-            .flow_control(FlowControl::None)
-            .exclusive(false);
+            .flow_control(FlowControl::None);
+        // `exclusive` controls Unix `TIOCEXCL`/`flock` behaviour and is not
+        // part of tokio-serial's Windows builder API.
+        #[cfg(unix)]
+        let builder = builder.exclusive(false);
         Ok(SerialStream::open(&builder)?)
     }
 

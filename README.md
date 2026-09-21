@@ -19,8 +19,18 @@
 | 系统 | 状态 |
 | --- | --- |
 | macOS | 本机实测（Apple Silicon） |
-| Linux | 已实现（`ip` / `resolvectl`），未在真机验证 |
-| Windows | 已实现（Wintun / `netsh` / `route`），未在真机验证；客机需要 `wintun.dll` |
+| Linux | CI 原生构建与测试（`ip` / `resolvectl`），真机待验证 |
+| Windows | CI 原生构建与测试（Wintun / `netsh` / `route`），真机待验证；客机需要 `wintun.dll` |
+
+## 下载
+
+[GitHub Releases](https://github.com/Luckyji6/NetM/releases) 提供三端预编译包：
+
+- macOS 通用二进制（Apple Silicon + Intel）
+- Linux x86_64
+- Windows x86_64
+
+每个 Release 同时附带 `SHA256SUMS`。Windows 客机还需要把官方 `wintun.dll` 放在 `netm.exe` 同目录或系统搜索路径中。
 
 ## 构建
 
