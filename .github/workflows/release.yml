@@ -18,7 +18,7 @@ jobs:
     name: macOS universal
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Test
@@ -37,7 +37,7 @@ jobs:
           cp README.md LICENSE package/
           version="${GITHUB_REF_NAME#v}"
           tar -C package -czf "dist/netm-${version}-macos-universal.tar.gz" netm README.md LICENSE
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: macos-universal
           path: dist/*
@@ -47,7 +47,7 @@ jobs:
     name: Linux x86_64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Test
         run: cargo test --workspace --all-targets --locked
       - name: Build and package
@@ -59,7 +59,7 @@ jobs:
           cp README.md LICENSE package/
           version="${GITHUB_REF_NAME#v}"
           tar -C package -czf "dist/netm-${version}-linux-x86_64.tar.gz" netm README.md LICENSE
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: linux-x86_64
           path: dist/*
@@ -69,7 +69,7 @@ jobs:
     name: Windows x86_64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Test
         run: cargo test --workspace --all-targets --locked
       - name: Build and package
@@ -83,7 +83,7 @@ jobs:
           $version = ($env:GITHUB_REF_NAME).TrimStart('v')
           Compress-Archive -Path package/netm.exe, package/README.md, package/LICENSE `
             -DestinationPath "dist/netm-$version-windows-x86_64.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: windows-x86_64
           path: dist/*
@@ -97,8 +97,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
